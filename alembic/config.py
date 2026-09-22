@@ -831,6 +831,12 @@ class CommandLine:
         "revision": dict(
             help="revision identifier",
         ),
+        "current": dict(
+            help="comma-separated current revision identifiers, or 'base'",
+        ),
+        "target": dict(
+            help="comma-separated target revision identifiers, or 'base'",
+        ),
         "revisions": dict(
             nargs="+",
             help="one or more revisions, or 'heads' for all heads",

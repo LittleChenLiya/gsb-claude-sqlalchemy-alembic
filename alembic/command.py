@@ -534,6 +534,55 @@ def downgrade(
         script.run_env()
 
 
+def preview(config: Config, current: str, target: str) -> None:
+    """Preview the migration path between two sets of heads.
+
+    The plan is computed without connecting to a database and without
+    running any migration scripts; it lists the downgrade steps
+    followed by the upgrade steps that would move the version state
+    from the current head set to the target head set, as well as the
+    heads that would remain.
+
+    :param config: a :class:`.Config` instance.
+
+    :param current: comma-separated revision identifiers for the
+     current head set, or ``"base"`` for the empty state.
+
+    :param target: comma-separated revision identifiers for the
+     target head set, or ``"base"`` for the empty state.
+
+    """
+
+    script = ScriptDirectory.from_config(config)
+    plan = script.preview_revisions(current, target)
+
+    config.print_stdout(
+        "Current heads: %s", ", ".join(plan.current_heads) or "(base)"
+    )
+    config.print_stdout(
+        "Target heads: %s", ", ".join(plan.target_heads) or "(base)"
+    )
+    if not plan.steps:
+        config.print_stdout("No migration steps required.")
+    for index, step in enumerate(plan.steps, 1):
+        config.print_stdout(
+            "Step %d: %s %s", index, step.direction, step.revision
+        )
+        if step.requires:
+            config.print_stdout("    requires: %s", ", ".join(step.requires))
+        if step.removes_heads:
+            config.print_stdout(
+                "    removes head(s): %s", ", ".join(step.removes_heads)
+            )
+        if step.adds_heads:
+            config.print_stdout(
+                "    adds head(s): %s", ", ".join(step.adds_heads)
+            )
+    config.print_stdout(
+        "Final heads: %s", ", ".join(plan.final_heads) or "(base)"
+    )
+
+
 def show(config: Config, rev: str) -> None:
     """Show the revision(s) denoted by the given symbol.
 

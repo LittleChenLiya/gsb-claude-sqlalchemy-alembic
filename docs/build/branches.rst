@@ -795,3 +795,73 @@ If there's any point to be made here, it's if you are too freely branching, merg
 and labeling, things can get pretty crazy!  Hence the branching system should
 be used carefully and thoughtfully for best results.
 
+
+
+Previewing a Migration Path
+---------------------------
+
+.. versionadded:: 1.19
+
+The ``alembic preview`` command shows the migration path between two sets of
+heads without connecting to a database and without running any migration
+scripts.  It takes a comma-separated set of current revision identifiers and
+a comma-separated set of target revision identifiers (``base`` indicates the
+empty, unstamped state), and prints the downgrade steps followed by the
+upgrade steps that would move the version state between the two sets, along
+with the heads that remain at the end::
+
+    $ alembic preview 55af2cb1c267,2a95102259be d747aff6d91a
+    Current heads: 2a95102259be, 55af2cb1c267
+    Target heads: d747aff6d91a
+    Step 1: downgrade 2a95102259be
+        removes head(s): 2a95102259be
+        adds head(s): 29f859a13ea
+    Step 2: downgrade 29f859a13ea
+        requires: 2a95102259be
+        removes head(s): 29f859a13ea
+        adds head(s): 109ec7d132bf
+    Step 3: downgrade 109ec7d132bf
+        requires: 29f859a13ea
+        removes head(s): 109ec7d132bf
+        adds head(s): 3cac04ae8714
+    Step 4: downgrade 3cac04ae8714
+        requires: 109ec7d132bf
+        removes head(s): 3cac04ae8714
+    Step 5: downgrade 55af2cb1c267
+        removes head(s): 55af2cb1c267
+        adds head(s): ae1027a6acf
+    Step 6: downgrade ae1027a6acf
+        requires: 55af2cb1c267
+        removes head(s): ae1027a6acf
+        adds head(s): 1975ea83b712
+    Step 7: upgrade 27c6a30d7c24
+        requires: 1975ea83b712
+        removes head(s): 1975ea83b712
+        adds head(s): 27c6a30d7c24
+    Step 8: upgrade d747aff6d91a
+        requires: 27c6a30d7c24
+        removes head(s): 27c6a30d7c24
+        adds head(s): d747aff6d91a
+    Final heads: d747aff6d91a
+
+Revisions that are ancestors of both head sets, including shared merge
+ancestors and ``depends_on`` dependencies, are left untouched; switching
+between branches does not rebuild their shared history.  Each step lists
+the revision, the direction, the prerequisite revisions that must be
+applied or unapplied first, and the heads the step adds and removes.
+
+Both revision sets are validated before any plan is produced.  Unknown or
+ambiguous revision identifiers, duplicate entries, and sets that mix a
+revision with one of its own ancestors are rejected with a diagnostic
+naming the offending entry, and no partial plan is emitted::
+
+    $ alembic preview 1975ea83b712,ae1027a6acf d747aff6d91a
+    FAILED: Invalid current revision set: revision '1975ea83b712' is an
+    ancestor of revision 'ae1027a6acf' within the same set; a head set may
+    not contain both a revision and one of its ancestors
+
+The same preview is available programmatically through
+:meth:`.ScriptDirectory.preview_revisions` and
+:meth:`.RevisionMap.preview_revisions`, which return a
+:class:`.MigrationPreview` describing the individual
+:class:`.PreviewStep` entries.

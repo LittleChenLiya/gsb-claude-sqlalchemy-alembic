@@ -10,6 +10,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Deque
+from typing import NamedTuple
 from typing import Optional
 from typing import overload
 from typing import Protocol
@@ -116,6 +117,61 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
 
     def __init__(self, revision: Sequence[str]) -> None:
         super().__init__(revision)
+
+
+class PreviewStep(NamedTuple):
+    """A single downgrade or upgrade step within a
+    :class:`.MigrationPreview`.
+
+    .. versionadded:: 1.19
+
+    """
+
+    revision: str
+    """The revision identifier this step unapplies or applies."""
+
+    direction: str
+    """Either ``"downgrade"`` or ``"upgrade"``."""
+
+    requires: tuple[str, ...]
+    """Immediate prerequisite revisions for this step.
+
+    For an upgrade step these are the revision's immediate down
+    revisions and dependencies, which must be applied first.  For a
+    downgrade step these are the revision's immediate dependents,
+    which must be unapplied first.
+    """
+
+    adds_heads: tuple[str, ...]
+    """Heads added to the version state by this step."""
+
+    removes_heads: tuple[str, ...]
+    """Heads removed from the version state by this step."""
+
+
+class MigrationPreview(NamedTuple):
+    """A preview of the migration path between two sets of heads.
+
+    The plan consists of a downgrade phase followed by an upgrade
+    phase.  Revisions that are ancestors of both the current and the
+    target head sets, including shared merge ancestors and
+    ``depends_on`` dependencies, are left untouched.
+
+    .. versionadded:: 1.19
+
+    """
+
+    current_heads: tuple[str, ...]
+    """The resolved current head set, sorted by revision identifier."""
+
+    target_heads: tuple[str, ...]
+    """The resolved target head set, sorted by revision identifier."""
+
+    steps: tuple[PreviewStep, ...]
+    """The downgrade steps followed by the upgrade steps."""
+
+    final_heads: tuple[str, ...]
+    """The heads remaining once all steps are applied."""
 
 
 class RevisionMap:
@@ -814,6 +870,213 @@ class RevisionMap:
 
         for node in self._topological_sort(revisions, heads):
             yield not_none(self.get_revision(node))
+
+    def preview_revisions(
+        self,
+        current: str | Iterable[str] | None,
+        target: str | Iterable[str] | None,
+    ) -> MigrationPreview:
+        """Preview the migration path between two sets of heads.
+
+        The returned :class:`.MigrationPreview` describes a downgrade
+        phase followed by an upgrade phase that would move the version
+        state from the `current` head set to the `target` head set.
+        The plan is computed purely from the revision map; no database
+        connection is established and no migration script is executed.
+
+        Revisions that are ancestors of both head sets, including
+        shared merge ancestors and ``depends_on`` dependencies, are
+        left untouched.  When several orderings of the steps are
+        possible, steps are ordered by full revision identifier.
+
+        :param current: the current head set, as a comma-separated
+         string or an iterable of revision identifiers.  ``None``,
+         an empty collection, and ``"base"`` indicate the empty
+         (unstamped) state.
+
+        :param target: the target head set, in the same form as
+         `current`.
+
+        Both sets are validated before any plan is produced: unknown
+        or ambiguous revision identifiers, duplicate entries, and sets
+        that contain a revision together with one of its ancestors are
+        rejected by raising :class:`.RevisionError`; no partial plan
+        is returned.
+
+        """
+        current_revs = self._resolve_preview_head_set(current, "current")
+        target_revs = self._resolve_preview_head_set(target, "target")
+
+        current_closure = self._preview_closure(current_revs)
+        target_closure = self._preview_closure(target_revs)
+
+        downgrade_ids = current_closure.difference(target_closure)
+        upgrade_ids = target_closure.difference(current_closure)
+
+        map_ = self._revision_map
+        applied = set(current_closure)
+        heads = self._preview_state_heads(applied)
+
+        steps: list[PreviewStep] = []
+
+        remaining = set(downgrade_ids)
+        while remaining:
+            ready = sorted(
+                rev_id
+                for rev_id in remaining
+                if not any(
+                    dependent in remaining
+                    for dependent in not_none(map_[rev_id])._all_nextrev
+                )
+            )
+            if not ready:
+                raise RevisionError(
+                    "Cannot compute downgrade preview; dependency cycle "
+                    "amongst revisions (%s)" % ", ".join(sorted(remaining))
+                )
+            rev_id = ready[0]
+            rev = not_none(map_[rev_id])
+            requires = tuple(
+                sorted(
+                    dependent
+                    for dependent in rev._all_nextrev
+                    if dependent in downgrade_ids
+                )
+            )
+            applied.discard(rev_id)
+            remaining.discard(rev_id)
+            new_heads = self._preview_state_heads(applied)
+            steps.append(
+                PreviewStep(
+                    revision=rev_id,
+                    direction="downgrade",
+                    requires=requires,
+                    adds_heads=tuple(
+                        head for head in new_heads if head not in heads
+                    ),
+                    removes_heads=tuple(
+                        head for head in heads if head not in new_heads
+                    ),
+                )
+            )
+            heads = new_heads
+
+        remaining = set(upgrade_ids)
+        while remaining:
+            ready = sorted(
+                rev_id
+                for rev_id in remaining
+                if not any(
+                    parent in remaining
+                    for parent in not_none(
+                        map_[rev_id]
+                    )._normalized_down_revisions
+                )
+            )
+            if not ready:
+                raise RevisionError(
+                    "Cannot compute upgrade preview; dependency cycle "
+                    "amongst revisions (%s)" % ", ".join(sorted(remaining))
+                )
+            rev_id = ready[0]
+            rev = not_none(map_[rev_id])
+            requires = tuple(sorted(rev._normalized_down_revisions))
+            applied.add(rev_id)
+            remaining.discard(rev_id)
+            new_heads = self._preview_state_heads(applied)
+            steps.append(
+                PreviewStep(
+                    revision=rev_id,
+                    direction="upgrade",
+                    requires=requires,
+                    adds_heads=tuple(
+                        head for head in new_heads if head not in heads
+                    ),
+                    removes_heads=tuple(
+                        head for head in heads if head not in new_heads
+                    ),
+                )
+            )
+            heads = new_heads
+
+        return MigrationPreview(
+            current_heads=tuple(sorted(rev.revision for rev in current_revs)),
+            target_heads=tuple(sorted(rev.revision for rev in target_revs)),
+            steps=tuple(steps),
+            final_heads=heads,
+        )
+
+    def _resolve_preview_head_set(
+        self, idents: str | Iterable[str] | None, label: str
+    ) -> tuple[Revision, ...]:
+        if idents is None:
+            tokens: list[str] = []
+        elif isinstance(idents, str):
+            tokens = idents.split(",")
+        else:
+            tokens = [
+                token for ident in idents for token in str(ident).split(",")
+            ]
+        tokens = [
+            token
+            for token in (token.strip() for token in tokens)
+            if token and token != "base"
+        ]
+
+        resolved: list[Revision] = []
+        seen: set[str] = set()
+        for index, token in enumerate(tokens):
+            try:
+                revisions = self.get_revisions(token)
+            except RevisionError as err:
+                raise RevisionError(
+                    "Cannot resolve %s revision '%s' (position %d): %s"
+                    % (label, token, index + 1, err)
+                ) from err
+            for rev in revisions:
+                if not isinstance(rev, Revision):
+                    continue
+                if rev.revision in seen:
+                    raise RevisionError(
+                        "Duplicate revision '%s' in %s revision set "
+                        "(position %d)" % (rev.revision, label, index + 1)
+                    )
+                seen.add(rev.revision)
+                resolved.append(rev)
+
+        resolved_set = set(resolved)
+        for rev in resolved:
+            for ancestor in self._get_ancestor_nodes(
+                [rev], include_dependencies=False
+            ):
+                if ancestor is rev or ancestor not in resolved_set:
+                    continue
+                raise RevisionError(
+                    "Invalid %s revision set: revision '%s' is an "
+                    "ancestor of revision '%s' within the same set; a "
+                    "head set may not contain both a revision and one "
+                    "of its ancestors"
+                    % (label, ancestor.revision, rev.revision)
+                )
+        return tuple(resolved)
+
+    def _preview_closure(self, revs: Collection[Revision]) -> set[str]:
+        return {
+            rev.revision
+            for rev in self._get_ancestor_nodes(
+                list(revs), include_dependencies=True
+            )
+        }
+
+    def _preview_state_heads(self, applied: set[str]) -> tuple[str, ...]:
+        map_ = self._revision_map
+        return tuple(
+            sorted(
+                rev_id
+                for rev_id in applied
+                if not not_none(map_[rev_id]).nextrev.intersection(applied)
+            )
+        )
 
     def _get_descendant_nodes(
         self,

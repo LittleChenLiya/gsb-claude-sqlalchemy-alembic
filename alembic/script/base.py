@@ -377,6 +377,37 @@ class ScriptDirectory:
             return list(self.revision_map._real_heads)
         return list(self.revision_map.heads)
 
+    def preview_revisions(
+        self,
+        current: str | Sequence[str] | None,
+        target: str | Sequence[str] | None,
+    ) -> revision.MigrationPreview:
+        """Preview the migration path between two sets of heads.
+
+        The returned :class:`.MigrationPreview` contains the downgrade
+        and upgrade steps that would move the version state from the
+        `current` head set to the `target` head set, as well as the
+        heads that would remain.  No database connection is established
+        and no migration script is executed.
+
+        :param current: the current head set, as a comma-separated
+         string or a sequence of revision identifiers.  ``None``, an
+         empty collection, and ``"base"`` indicate the empty
+         (unstamped) state.
+
+        :param target: the target head set, in the same form as
+         `current`.
+
+        .. versionadded:: 1.19
+
+        .. seealso::
+
+            :meth:`.RevisionMap.preview_revisions`
+
+        """
+        with self._catch_revision_errors():
+            return self.revision_map.preview_revisions(current, target)
+
     def get_base(self) -> str | None:
         """Return the "base" revision as a string.
 
