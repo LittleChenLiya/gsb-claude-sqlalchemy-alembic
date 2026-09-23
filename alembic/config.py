@@ -806,6 +806,15 @@ class CommandLine:
                 help="Unconditionally erase the version table before stamping",
             ),
         ),
+        "target": (
+            "--to",
+            dict(
+                dest="target",
+                action="append",
+                help="Specify one or more revision identifiers that make "
+                "up the target head set for the 'preview' command.",
+            ),
+        ),
         "package": (
             "--package",
             dict(
@@ -828,6 +837,10 @@ class CommandLine:
     }
     _POSITIONAL_OPTS = {
         "directory": dict(help="location of scripts directory"),
+        "current": dict(
+            nargs="+",
+            help="one or more revisions making up the current head set",
+        ),
         "revision": dict(
             help="revision identifier",
         ),

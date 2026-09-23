@@ -444,6 +444,34 @@ class ScriptDirectory:
                 for script in revs
             ]
 
+    def preview_revisions(
+        self, current: _GetRevArg, target: _GetRevArg
+    ) -> revision.RevisionPlan:
+        """Produce a database-free preview plan that switches the
+        abstract revision state from the ``current`` head set to the
+        ``target`` head set.
+
+        The returned :class:`.RevisionPlan` lists downgrade steps
+        followed by upgrade steps; each step indicates the revision,
+        the direction, its prerequisite revisions, and the heads it
+        adds and removes.  Branches, merge revisions and ``depends_on``
+        dependencies are handled using the same :class:`.RevisionMap`
+        semantics as a real migration, and shared ancestors required
+        by both head sets are preserved.
+
+        Both head sets are validated up front; unknown revisions,
+        ambiguous partial identifiers, ancestors mixed into the same
+        set, or dependency cycles cause the whole plan to be rejected
+        with :class:`.RevisionPlanError` (or :class:`.CycleDetected`).
+
+        No database connection is established and no migration script
+        is invoked.
+
+        .. versionadded:: 1.21
+
+        """
+        return self.revision_map.preview_plan(current, target)
+
     def _stamp_revs(
         self, revision: _RevIdType, heads: _RevIdType
     ) -> list[StampStep]:

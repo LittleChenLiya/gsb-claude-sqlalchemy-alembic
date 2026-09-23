@@ -1045,6 +1045,59 @@ Back to nothing - and up again::
     INFO  [alembic.context] Running upgrade None -> 1975ea83b712
     INFO  [alembic.context] Running upgrade 1975ea83b712 -> ae1027a6acf
 
+.. _preview_head_switch:
+
+Previewing a Head Switch
+=========================
+
+.. versionadded:: 1.21
+
+The ``alembic preview`` command shows the exact downgrade and upgrade
+steps needed to move from one set of heads to another, **without
+connecting to a database and without running any migration scripts**.
+It answers the question "what would it take to get from where I am to
+where I want to be" before anything is touched::
+
+    $ alembic preview bbbb0002 cccc0003 --to dddd0004
+    Current heads: bbbb0002, cccc0003
+    Target heads: dddd0004
+    Step 1: upgrade dddd0004 (requires: bbbb0002, cccc0003); removes heads: bbbb0002, cccc0003; adds heads: dddd0004
+    Final heads: dddd0004
+
+Downgrade steps are listed first, followed by upgrade steps.  Each step
+shows the revision, the direction, its prerequisite revisions (down
+revisions and ``depends_on`` dependencies), and the heads it removes
+and adds.  Merge revisions are applied only once, and splitting a merge
+back apart restores each branch head::
+
+    $ alembic preview dddd0004 --to bbbb0002 --to cccc0003
+    Current heads: dddd0004
+    Target heads: bbbb0002, cccc0003
+    Step 1: downgrade dddd0004 (requires: bbbb0002, cccc0003); removes heads: dddd0004; adds heads: bbbb0002, cccc0003
+    Final heads: bbbb0002, cccc0003
+
+Both the current and the target head sets are validated before any plan
+is produced.  Unknown revisions, ambiguous partial identifiers, sets
+that mix a revision with its own ancestor, and dependency cycles are
+all rejected with a diagnostic that points at the offending position,
+and no partial plan is emitted::
+
+    $ alembic preview aaaa0001 dddd0004 --to bbbb0002
+    FAILED: current[1]: revision 'dddd0004' may not be combined with its own ancestor(s) 'aaaa0001' in the current head set
+
+The same functionality is available programmatically via
+:meth:`.ScriptDirectory.preview_revisions`, which returns a
+:class:`alembic.script.revision.RevisionPlan` composed of
+:class:`alembic.script.revision.PreviewStep` entries::
+
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(alembic_cfg)
+    plan = script.preview_revisions(["bbbb0002", "cccc0003"], ["dddd0004"])
+    for step in plan.steps:
+        print(step.direction, step.revision, step.add_heads, step.remove_heads)
+    print(plan.final_heads)
+
 Next Steps
 ==========
 

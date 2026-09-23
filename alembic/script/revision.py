@@ -5,6 +5,7 @@ from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
+import dataclasses
 import re
 from typing import Any
 from typing import Callable
@@ -116,6 +117,68 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
 
     def __init__(self, revision: Sequence[str]) -> None:
         super().__init__(revision)
+
+
+class RevisionPlanError(RevisionError):
+    """Raised when a migration preview plan cannot be constructed.
+
+    The message indicates which input position caused the failure;
+    no partial plan is produced.
+
+    .. versionadded:: 1.21
+
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class PreviewStep:
+    """A single step within a :class:`.RevisionPlan`.
+
+    .. versionadded:: 1.21
+
+    """
+
+    revision: str
+    """The full revision identifier this step applies."""
+
+    direction: str
+    """Either ``"upgrade"`` or ``"downgrade"``."""
+
+    requires: tuple[str, ...]
+    """Immediate prerequisite revisions for this step's revision,
+    i.e. its down revision(s) and direct dependencies."""
+
+    add_heads: tuple[str, ...]
+    """Heads added to the abstract revision state by this step."""
+
+    remove_heads: tuple[str, ...]
+    """Heads consumed from the abstract revision state by this step."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RevisionPlan:
+    """A database-free preview of a switch between two head sets.
+
+    Produced by :meth:`.RevisionMap.preview_plan`.  The plan consists of
+    zero or more downgrade steps followed by zero or more upgrade steps.
+    No database connection is established and no migration script is
+    executed in order to build the plan.
+
+    .. versionadded:: 1.21
+
+    """
+
+    current_heads: tuple[str, ...]
+    """The resolved current head set, sorted by revision string."""
+
+    target_heads: tuple[str, ...]
+    """The resolved target head set, sorted by revision string."""
+
+    steps: tuple[PreviewStep, ...]
+    """The ordered :class:`.PreviewStep` entries to apply."""
+
+    final_heads: tuple[str, ...]
+    """The heads remaining once all steps are applied."""
 
 
 class RevisionMap:
@@ -1526,6 +1589,208 @@ class RevisionMap:
             self._get_ancestor_nodes(list(top_revs), include_dependencies=True)
         )
         return self._filter_into_branch_heads(top_revs)
+
+    def preview_plan(
+        self, current: _GetRevArg, target: _GetRevArg
+    ) -> RevisionPlan:
+        """Produce a database-free preview plan that switches the
+        abstract revision state from the ``current`` head set to the
+        ``target`` head set.
+
+        The plan consists of zero or more downgrade steps followed by
+        zero or more upgrade steps.  Dependency and traversal semantics
+        are those of this :class:`.RevisionMap`, including merge
+        revisions and ``depends_on`` dependencies; ancestors that are
+        shared by both head sets are preserved rather than treated as a
+        plain set difference.  Where several step orderings are valid,
+        steps are ordered by the full revision string.
+
+        Both ``current`` and ``target`` must be valid head sets: every
+        identifier must resolve to a known revision (unambiguous
+        partial identifiers are accepted), no element may be an
+        ancestor of another element of the same set, and the revision
+        map must be free of dependency cycles.  Any violation raises
+        :class:`.RevisionPlanError` (or :class:`.CycleDetected`) and no
+        plan is returned.
+
+        No database connection is established and no migration script
+        is invoked.
+
+        .. versionadded:: 1.21
+
+        """
+        current_heads = self._resolve_preview_head_set(current, "current")
+        target_heads = self._resolve_preview_head_set(target, "target")
+
+        map_ = self._revision_map
+        current_closure = self._preview_closure(current_heads)
+        target_closure = self._preview_closure(target_heads)
+
+        downgrade_ids = current_closure - target_closure
+        upgrade_ids = target_closure - current_closure
+
+        state = set(current_heads)
+        steps = []
+        for direction, ordered in (
+            ("downgrade", self._preview_order(downgrade_ids, reverse=True)),
+            ("upgrade", self._preview_order(upgrade_ids, reverse=False)),
+        ):
+            for rev_id in ordered:
+                rev = not_none(map_[rev_id])
+                requires = tuple(sorted(rev._all_down_revisions))
+                if direction == "upgrade":
+                    new_state = self._preview_heads_of(state | {rev_id})
+                else:
+                    new_state = self._preview_heads_of(
+                        (state - {rev_id}) | set(requires)
+                    )
+                steps.append(
+                    PreviewStep(
+                        revision=rev_id,
+                        direction=direction,
+                        requires=requires,
+                        add_heads=tuple(sorted(new_state - state)),
+                        remove_heads=tuple(sorted(state - new_state)),
+                    )
+                )
+                state = new_state
+
+        if state != set(target_heads):
+            raise RevisionPlanError(
+                "Internal error: preview plan ends at heads %s, which "
+                "does not match the target head set %s"
+                % (sorted(state), sorted(target_heads))
+            )
+
+        return RevisionPlan(
+            current_heads=tuple(sorted(current_heads)),
+            target_heads=tuple(sorted(target_heads)),
+            steps=tuple(steps),
+            final_heads=tuple(sorted(state)),
+        )
+
+    def _resolve_preview_head_set(
+        self, identifiers: _GetRevArg, role: str
+    ) -> tuple[str, ...]:
+        # force map initialization so that structural problems such as
+        # dependency cycles are raised before any input is consumed
+        self._revision_map
+
+        if identifiers is None:
+            id_list: tuple[str, ...] = ()
+        elif isinstance(identifiers, str):
+            id_list = (identifiers,)
+        else:
+            id_list = cast("tuple[str, ...]", tuple(identifiers))
+
+        resolved: list[str] = []
+        seen: dict[str, int] = {}
+        for idx, ident in enumerate(id_list):
+            try:
+                rev = self.get_revision(ident)
+            except RevisionError as err:
+                raise RevisionPlanError(
+                    "%s[%d]: cannot resolve %r: %s" % (role, idx, ident, err)
+                ) from err
+            if rev is None:
+                raise RevisionPlanError(
+                    "%s[%d]: %r does not identify a revision; pass an "
+                    "empty set to indicate 'base'" % (role, idx, ident)
+                )
+            if rev.revision in seen:
+                raise RevisionPlanError(
+                    "%s[%d]: revision %r duplicates %s[%d]"
+                    % (role, idx, rev.revision, role, seen[rev.revision])
+                )
+            seen[rev.revision] = idx
+            resolved.append(rev.revision)
+
+        members = set(resolved)
+        for idx, rev_id in enumerate(resolved):
+            ancestors = {
+                ancestor.revision
+                for ancestor in self._get_ancestor_nodes(
+                    [not_none(self._revision_map[rev_id])]
+                )
+            } - {rev_id}
+            overlap = sorted(ancestors & members)
+            if overlap:
+                raise RevisionPlanError(
+                    "%s[%d]: revision %r may not be combined with its "
+                    "own ancestor(s) %s in the %s head set"
+                    % (
+                        role,
+                        idx,
+                        rev_id,
+                        ", ".join(repr(o) for o in overlap),
+                        role,
+                    )
+                )
+        return tuple(resolved)
+
+    def _preview_closure(self, rev_ids: Collection[str]) -> set[str]:
+        if not rev_ids:
+            return set()
+        return {
+            rev.revision
+            for rev in self._get_ancestor_nodes(
+                [not_none(self._revision_map[rev_id]) for rev_id in rev_ids]
+            )
+        }
+
+    def _preview_heads_of(self, rev_ids: Collection[str]) -> set[str]:
+        """Return the heads of an abstract applied-revision set, i.e.
+        those members that are not an ancestor of any other member."""
+        ids = set(rev_ids)
+        non_heads: set[str] = set()
+        for rev_id in ids:
+            non_heads.update(
+                ancestor.revision
+                for ancestor in self._get_ancestor_nodes(
+                    [not_none(self._revision_map[rev_id])]
+                )
+                if ancestor.revision != rev_id
+            )
+        return ids - non_heads
+
+    def _preview_order(
+        self, rev_ids: Collection[str], reverse: bool
+    ) -> list[str]:
+        """Return a deterministic topological ordering of ``rev_ids``.
+
+        For upgrades (``reverse=False``) prerequisites come first; for
+        downgrades (``reverse=True``) dependents come first.  Ties are
+        broken by sorting on the full revision string.
+        """
+        map_ = self._revision_map
+        ids = set(rev_ids)
+        blockers: dict[str, set[str]] = {rev_id: set() for rev_id in ids}
+        for rev_id in ids:
+            for prereq in not_none(map_[rev_id])._all_down_revisions:
+                if prereq in ids:
+                    if reverse:
+                        blockers[prereq].add(rev_id)
+                    else:
+                        blockers[rev_id].add(prereq)
+
+        done: set[str] = set()
+        remaining = set(ids)
+        order: list[str] = []
+        while remaining:
+            ready = sorted(
+                rev_id for rev_id in remaining if blockers[rev_id] <= done
+            )
+            if not ready:
+                raise RevisionPlanError(
+                    "Cannot determine a consistent ordering for "
+                    "revisions %s; a dependency cycle may be present"
+                    % sorted(remaining)
+                )
+            pick = ready[0]
+            order.append(pick)
+            done.add(pick)
+            remaining.discard(pick)
+        return order
 
 
 class Revision:

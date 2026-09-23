@@ -10,6 +10,7 @@ from . import autogenerate as autogen
 from . import util
 from .runtime.environment import EnvironmentContext
 from .script import ScriptDirectory
+from .script.revision import RevisionError
 from .util import compat
 
 if TYPE_CHECKING:
@@ -532,6 +533,65 @@ def downgrade(
         tag=tag,
     ):
         script.run_env()
+
+
+def preview(
+    config: Config,
+    current: list[str],
+    target: list[str] | None = None,
+    verbose: bool = False,
+) -> None:
+    """Preview the steps to switch between two head sets, offline.
+
+    Shows the downgrade and upgrade steps needed to switch from one
+    set of heads to another, without connecting to a database or
+    running any migration scripts.
+
+    :param config: a :class:`.Config` instance.
+
+    :param current: one or more revision identifiers that make up the
+     current head set.
+
+    :param target: one or more revision identifiers, given with the
+     ``--to`` option, that make up the desired head set.
+
+    :param verbose: output in verbose mode.
+
+    """
+    script = ScriptDirectory.from_config(config)
+
+    if not target:
+        raise util.CommandError(
+            "the --to option is required to specify the target head set"
+        )
+
+    try:
+        plan = script.preview_revisions(current, target)
+    except RevisionError as err:
+        raise util.CommandError(str(err)) from err
+
+    config.print_stdout(
+        "Current heads: %s", ", ".join(plan.current_heads) or "(base)"
+    )
+    config.print_stdout(
+        "Target heads: %s", ", ".join(plan.target_heads) or "(base)"
+    )
+    if not plan.steps:
+        config.print_stdout("No migration steps required.")
+    for idx, step in enumerate(plan.steps, 1):
+        config.print_stdout(
+            "Step %d: %s %s (requires: %s); removes heads: %s; "
+            "adds heads: %s",
+            idx,
+            step.direction,
+            step.revision,
+            ", ".join(step.requires) or "(none)",
+            ", ".join(step.remove_heads) or "(none)",
+            ", ".join(step.add_heads) or "(none)",
+        )
+    config.print_stdout(
+        "Final heads: %s", ", ".join(plan.final_heads) or "(base)"
+    )
 
 
 def show(config: Config, rev: str) -> None:
