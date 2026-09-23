@@ -131,6 +131,40 @@ def _compare_indexes_and_uniques(
                 )
             ]
 
+        # when columns were renamed via the column_rename_map option,
+        # remap the reflected column names to the new (metadata-side)
+        # names; the conn_table given here then carries the new names
+        # as well, so constraints and indexes are matched by their
+        # renamed column identity
+        local_renames = autogen_context._column_renames.get(
+            (schema, tname), {}
+        )
+        if local_renames:
+
+            def _remap_reflected(params):
+                params = dict(params)
+                params["column_names"] = [
+                    (
+                        local_renames.get(cname, cname)
+                        if cname is not None
+                        else None
+                    )
+                    for cname in params["column_names"]
+                ]
+                if params.get("column_sorting"):
+                    params["column_sorting"] = {
+                        local_renames.get(cname, cname): sorting
+                        for cname, sorting in params["column_sorting"].items()
+                    }
+                return params
+
+            conn_uniques_reflected = [
+                _remap_reflected(uq) for uq in conn_uniques_reflected
+            ]
+            conn_indexes_reflected = [
+                _remap_reflected(ix) for ix in conn_indexes_reflected
+            ]
+
         # 2. convert conn-level objects from raw inspector records
         # into schema objects
         if is_drop_table:
@@ -562,13 +596,35 @@ def _make_unique_constraint(
 
 
 def _make_foreign_key(
-    params: ReflectedForeignKeyConstraint, conn_table: Table
+    params: ReflectedForeignKeyConstraint,
+    conn_table: Table,
+    renamed_referred_table: Table | None = None,
 ) -> ForeignKeyConstraint:
     tname = params["referred_table"]
     if params["referred_schema"]:
         tname = "%s.%s" % (params["referred_schema"], tname)
 
     options = params.get("options", {})
+
+    if renamed_referred_table is not None:
+        # the referred table has renamed columns; resolve the referred
+        # columns directly against the renamed copy of the reflected
+        # table, so that the foreign key is matched by the new
+        # (metadata-side) column identity
+        const = sa_schema.ForeignKeyConstraint(
+            [conn_table.c[cname] for cname in params["constrained_columns"]],
+            [
+                renamed_referred_table.c[cname]
+                for cname in params["referred_columns"]
+            ],
+            onupdate=options.get("onupdate"),
+            ondelete=options.get("ondelete"),
+            deferrable=options.get("deferrable"),
+            initially=options.get("initially"),
+            name=params["name"],
+        )
+        conn_table.append_constraint(const)
+        return const
 
     const = sa_schema.ForeignKeyConstraint(
         [conn_table.c[cname] for cname in params["constrained_columns"]],
@@ -657,9 +713,49 @@ def _compare_foreign_keys(
         )
     ]
 
-    conn_fks = {
-        _make_foreign_key(const, conn_table) for const in conn_fks_list
-    }
+    # when columns were renamed via the column_rename_map option, the
+    # reflected foreign keys still refer to the old column names; remap
+    # both the local (constrained) and referred column names so that
+    # foreign keys, including composite ones, are matched by their new
+    # column identity
+    column_renames = autogen_context._column_renames
+    if column_renames:
+        default_schema = inspector.bind.dialect.default_schema_name
+        local_renames = column_renames.get((schema, tname), {})
+        renamed_conn_tables = autogen_context._renamed_conn_tables
+        conn_fks = set()
+        for fk in conn_fks_list:
+            referred_schema = fk["referred_schema"]
+            if referred_schema == default_schema:
+                referred_schema = None
+            table_renames = column_renames.get(
+                (referred_schema, fk["referred_table"])
+            )
+            if local_renames or table_renames:
+                fk = dict(fk)  # type: ignore[assignment]
+                if local_renames:
+                    fk["constrained_columns"] = [
+                        local_renames.get(cname, cname)
+                        for cname in fk["constrained_columns"]
+                    ]
+                if table_renames:
+                    fk["referred_columns"] = [
+                        table_renames.get(cname, cname)
+                        for cname in fk["referred_columns"]
+                    ]
+            conn_fks.add(
+                _make_foreign_key(
+                    fk,
+                    conn_table,
+                    renamed_conn_tables.get(
+                        (referred_schema, fk["referred_table"])
+                    ),
+                )
+            )
+    else:
+        conn_fks = {
+            _make_foreign_key(const, conn_table) for const in conn_fks_list
+        }
 
     impl = autogen_context.migration_context.impl
 

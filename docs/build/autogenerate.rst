@@ -165,6 +165,8 @@ Autogenerate **can not detect**:
   tables, and should be hand-edited into a name change instead.
 * Changes of column name.  Like table name changes, these are detected as
   a column add/drop pair, which is not at all the same as a name change.
+  An explicit mapping of intended renames may be declared to have them
+  detected as renames; see :ref:`autogenerate_column_renames`.
 * Anonymously named constraints.  Give your constraints a name,
   e.g. ``UniqueConstraint('col1', 'col2', name="my_name")``.  See the section
   :doc:`naming` for background on how to configure automatic naming schemes
@@ -191,6 +193,118 @@ Autogenerate can't currently, but **will eventually detect**:
   within the autogenerate detection system and also may not be supported by
   the supporting SQLAlchemy dialect.
 * Sequence additions, removals - not yet implemented.
+
+.. _autogenerate_column_renames:
+
+Detecting Column Renames
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.21.0
+
+By default, autogenerate cannot tell a renamed column apart from a
+dropped column plus an added column, and will emit a data-destroying
+``drop_column()`` / ``add_column()`` pair.  An explicit rename mapping
+may be supplied using the
+:paramref:`.EnvironmentContext.configure.column_rename_map` parameter,
+which causes matching column pairs to be rendered as a single
+:meth:`.Operations.alter_column` operation using its
+``new_column_name`` parameter::
+
+    context.configure(
+        # ...
+        column_rename_map={
+            (None, "account", "nickname"): "display_name",
+        },
+    )
+
+Keys are ``(schema_name, table_name, old_column_name)`` tuples where
+``schema_name`` may be ``None`` for the default schema, and values are
+the new column names.  Each entry applies only within the named table.
+When the mapping is not provided, column comparison behaves exactly as
+before.
+
+Every entry is validated **before any operations are generated**.  Each
+rename must be one-to-one: the old column must exist in the database
+and must already be removed from the target :class:`~sqlalchemy.schema.MetaData`,
+while the new column must be present in the target
+:class:`~sqlalchemy.schema.MetaData` and must not yet exist in the
+database.  Chained renames, rename cycles, and two columns renaming to
+the same new name are all rejected.  If any entry is invalid, the whole
+autogenerate run fails with a diagnostic that names the offending table
+and columns; no partial migration is produced.
+
+When a rename coincides with a type, nullability, or server default
+change, those changes are preserved on the same
+:class:`.AlterColumnOp`, and the operation is reversible, so downgrade
+operations rename the column back.
+
+Constraint and index comparison matches columns by their renamed
+identity.  This includes **composite foreign keys** that refer to a
+renamed column as well as **explicitly named constraints** and indexes
+defined on a renamed column: they compare equal across the rename and
+are not dropped and re-created.  Renames are matched per table, so a
+foreign key in another table that refers to the renamed column is also
+matched correctly.  If a column participates in a constraint or index
+and no rename is declared for it, that constraint or index is reported
+as changed (drop/add); it is never silently omitted from the diff.
+
+On SQLite, the generated operations run through the usual
+:ref:`batch mode <batch_migrations>` machinery; rendering with
+``render_as_batch=True`` emits ``batch_op.alter_column(...,
+new_column_name=...)`` which SQLite executes using its move-and-copy
+strategy against the real reflected table.
+
+A self-contained demonstration, which builds a temporary SQLite
+database, generates upgrade and downgrade operations from a rename
+map, and shows an invalid map being rejected, can be run in a few
+seconds::
+
+    python - <<'EOF'
+    from sqlalchemy import (
+        Column, Integer, MetaData, String, Table, create_engine, text,
+    )
+    from alembic.autogenerate import produce_migrations
+    from alembic.autogenerate.api import render_python_code
+    from alembic.migration import MigrationContext
+    from alembic.util import CommandError
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "create table account (id integer primary key, nickname varchar)"
+        ))
+        conn.execute(text("insert into account values (1, 'alice'), (2, 'bob')"))
+
+    metadata = MetaData()
+    Table(
+        "account", metadata,
+        Column("id", Integer, primary_key=True),
+        Column("display_name", String(50)),
+    )
+
+    opts = {
+        "target_metadata": metadata,
+        "column_rename_map": {(None, "account", "nickname"): "display_name"},
+    }
+    with engine.connect() as conn:
+        mc = MigrationContext.configure(conn, opts=opts)
+        script = produce_migrations(mc, metadata)
+        print(render_python_code(script.upgrade_ops, render_as_batch=True))
+
+        # an invalid map is rejected before anything is generated
+        bad = dict(opts, column_rename_map={(None, "account", "nope"): "x"})
+        try:
+            produce_migrations(
+                MigrationContext.configure(conn, opts=bad), metadata
+            )
+        except CommandError as err:
+            print("rejected:", err)
+    EOF
+
+The upgrade output contains a single
+``batch_op.alter_column('nickname', ..., new_column_name='display_name')``
+instead of a drop/add pair, and the invalid map prints a diagnostic
+naming the ``account`` table and the missing ``nope`` column.
 
 .. _autogenerate_check_constraints:
 

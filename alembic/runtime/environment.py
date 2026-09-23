@@ -431,6 +431,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         ) = None,
         compare_type: bool | CompareType = True,
         compare_server_default: bool | CompareServerDefault = False,
+        column_rename_map: dict[tuple[str | None, str, str], str] | None = (
+            None
+        ),
         render_item: RenderItemFn | None = None,
         literal_binds: bool = False,
         upgrade_token: str = "upgrades",
@@ -624,9 +627,56 @@ class EnvironmentContext(util.ModuleClsProxy):
          execute
          the two defaults on the database side to compare for equivalence.
 
+        .. seealso::
+
+           :paramref:`.EnvironmentContext.configure.compare_type`
+
+        :param column_rename_map: an optional mapping that declares
+         intended column renames for autogenerate, so that a renamed
+         column is detected as an :class:`.AlterColumnOp` carrying the
+         new name rather than as a dropped column plus an added column.
+
+         The mapping is a dictionary whose keys are three-tuples of
+         ``(schema_name, table_name, old_column_name)`` and whose values
+         are the new column names.  ``schema_name`` may be ``None`` for
+         the default schema.  Each entry applies only within the named
+         table::
+
+            context.configure(
+                # ...
+                column_rename_map = {
+                    (None, "account", "nickname"): "display_name",
+                }
+            )
+
+         Every entry must describe a one-to-one rename: the old column
+         must exist in the database and no longer be present in the
+         target metadata, and the new column must be present in the
+         target metadata and not yet exist in the database.  Chained
+         renames, rename cycles, and two columns renaming to the same
+         new name are rejected.  All entries are validated before any
+         operations are generated; if any entry is invalid, the whole
+         autogenerate run fails with a diagnostic naming the offending
+         table and columns, and no partial migration is produced.
+
+         When a rename is combined with type, nullability, or server
+         default changes, those changes are preserved on the same
+         :class:`.AlterColumnOp`.  Constraint and index comparison
+         (including composite foreign keys and explicitly named
+         constraints) matches columns by their renamed identity, so
+         dependent constraints and indexes are not dropped and
+         re-created.  If a renamed column participates in a constraint
+         or index and no rename is declared for it, that constraint or
+         index is reported as changed; it is never silently omitted.
+
+         When the mapping is not provided, column comparison behaves
+         exactly as before.
+
+         .. versionadded:: 1.21.0
+
          .. seealso::
 
-            :paramref:`.EnvironmentContext.configure.compare_type`
+            :ref:`autogenerate_column_renames`
 
         :param include_name: A callable function which is given
          the chance to return ``True`` or ``False`` for any database reflected
@@ -932,6 +982,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["compare_type"] = compare_type
         if compare_server_default is not None:
             opts["compare_server_default"] = compare_server_default
+        opts["column_rename_map"] = column_rename_map
         opts["script"] = self.script
 
         opts.update(kw)

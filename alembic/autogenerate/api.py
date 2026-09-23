@@ -399,6 +399,21 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+        self._column_renames: dict[tuple[str | None, str], dict[str, str]]
+        self._column_renames = {}
+        self._renamed_conn_tables: dict[tuple[str | None, str], Table]
+        self._renamed_conn_tables = {}
+
+    @util.memoized_property
+    def column_rename_map(self) -> dict[tuple[str | None, str, str], str]:
+        """The raw ``column_rename_map`` option, or an empty dict.
+
+        Keys are ``(schema_name, table_name, old_column_name)`` tuples,
+        values are the new column names.  See
+        :paramref:`.EnvironmentContext.configure.column_rename_map`.
+
+        """
+        return self.opts.get("column_rename_map") or {}
 
     @util.memoized_property
     def inspector(self) -> Inspector:
