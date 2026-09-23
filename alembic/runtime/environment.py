@@ -431,6 +431,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         ) = None,
         compare_type: bool | CompareType = True,
         compare_server_default: bool | CompareServerDefault = False,
+        column_renames: (
+            Mapping[tuple[str | None, str, str] | tuple[str, str], str] | None
+        ) = None,
         render_item: RenderItemFn | None = None,
         literal_binds: bool = False,
         upgrade_token: str = "upgrades",
@@ -627,6 +630,50 @@ class EnvironmentContext(util.ModuleClsProxy):
          .. seealso::
 
             :paramref:`.EnvironmentContext.configure.compare_type`
+
+        :param column_renames: An optional mapping that tells autogenerate
+         to treat specific column drop/add pairs as column renames.
+
+         Keys are ``(schema, table_name, old_column_name)`` tuples, where
+         ``schema`` may be ``None`` for the default schema; a
+         ``(table_name, old_column_name)`` two-tuple is also accepted and
+         implies the default schema.  Values are the new column names.
+         Each mapping applies only within the named table::
+
+            context.configure(
+                target_metadata=my_metadata,
+                column_renames={
+                    (None, "account", "nickname"): "display_name",
+                },
+            )
+
+         Every mapping is validated before any operations are generated:
+         the old column must exist in the database and must no longer be
+         present in the target :class:`~sqlalchemy.schema.MetaData`, and
+         the new column must be present in the target
+         :class:`~sqlalchemy.schema.MetaData` and must not yet exist in
+         the database.  Mappings must be one-to-one; chained or circular
+         renames and multiple old columns mapping to the same new column
+         are rejected.  If any mapping is invalid, a
+         :class:`~alembic.util.CommandError` is raised naming the
+         offending tables and columns, and no migration is produced.
+
+         A valid rename renders as an
+         :meth:`.Operations.alter_column` call with ``new_column_name``
+         set, preserving any simultaneous type, nullability, or server
+         default changes, and is reversible for downgrade generation.
+         Indexes, unique constraints, and foreign keys (including
+         composite foreign keys) that span a renamed column are matched
+         by their new column identity, so they are not dropped and
+         re-created; constraint and index *names* are not affected by
+         the mapping.  When the mapping is omitted, comparison behaves
+         exactly as before.
+
+         .. versionadded:: 1.21
+
+         .. seealso::
+
+            :ref:`autogen_column_renames`
 
         :param include_name: A callable function which is given
          the chance to return ``True`` or ``False`` for any database reflected
@@ -932,6 +979,8 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["compare_type"] = compare_type
         if compare_server_default is not None:
             opts["compare_server_default"] = compare_server_default
+        if column_renames is not None:
+            opts["column_renames"] = column_renames
         opts["script"] = self.script
 
         opts.update(kw)

@@ -276,6 +276,70 @@ Given the above, the feature is most appropriate for a schema in which all
 CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
+.. _autogen_column_renames:
+
+Renaming Columns
+^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.21
+
+By default, autogenerate compares columns by name only: a column that was
+renamed in the model looks like a dropped column plus an added column,
+which produces a data-destroying ``DROP``/``ADD`` pair.  The optional
+:paramref:`.EnvironmentContext.configure.column_renames` mapping tells
+autogenerate to treat specific pairs as renames instead::
+
+    context.configure(
+        target_metadata=my_metadata,
+        column_renames={
+            (None, "account", "nickname"): "display_name",
+        },
+    )
+
+Each key is a ``(schema, table_name, old_column_name)`` tuple, where
+``schema`` may be ``None`` for the default schema; a
+``(table_name, old_column_name)`` two-tuple is also accepted.  Each value
+is the new column name.  A mapping applies **only within the named table**.
+When the option is omitted, comparison behaves exactly as before.
+
+Every mapping is validated **before any operations are generated**.  For
+each entry, the old column must exist in the database and must already be
+removed from the target :class:`~sqlalchemy.schema.MetaData`, while the new
+column must exist in the target :class:`~sqlalchemy.schema.MetaData` and
+must not yet exist in the database.  Mappings must be one-to-one: chained
+renames (``a -> b`` and ``b -> c``), circular renames (``a -> b`` and
+``b -> a``), and two old columns mapping to the same new column are all
+rejected.  If any entry is invalid, a :class:`~alembic.util.CommandError`
+is raised that names every offending table and column, and no migration
+script is produced.
+
+A valid rename renders as an :meth:`.Operations.alter_column` call with
+``new_column_name`` set.  If the rename coincides with a type, nullability,
+or server default change, those changes are preserved on the same
+operation, and the operation reverses correctly for downgrade generation.
+The feature works with :ref:`batch mode <batch_migrations>` on SQLite as
+well; the comparison always runs against the live reflected database
+schema.
+
+**Constraints and indexes.**  Indexes, unique constraints, and foreign
+keys that span a renamed column are compared using the renamed column
+identity, so they are *not* dropped and re-created when only the column
+name changed.  This includes composite foreign keys, whose column lists
+are translated element by element, and foreign keys in *other* tables
+that refer to a renamed column.  Explicitly named constraints and indexes
+keep their names: the mapping renames columns only, so a constraint or
+index whose *name* also changed in the metadata is still reported as a
+drop/add pair, exactly as before.  CHECK constraints and other
+expression-based constructs are not translated; a CHECK constraint whose
+expression text references the old column name should be updated in the
+metadata as part of the same revision.
+
+**Try it.**  The regression suite demonstrates a valid mapping producing a
+reversible rename operation as well as the rejection of invalid mappings,
+in well under 90 seconds::
+
+    python -m pytest tests/test_autogen_renames.py -v
+
 
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

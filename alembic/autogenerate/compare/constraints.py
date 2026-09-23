@@ -133,19 +133,24 @@ def _compare_indexes_and_uniques(
 
         # 2. convert conn-level objects from raw inspector records
         # into schema objects
+        column_renames = autogen_context._column_renames_for_table(
+            schema, tname
+        )
         if is_drop_table:
             # for DROP TABLE uniques are inline, don't need them
             conn_uniques = set()
         else:
             conn_uniques = {
-                _make_unique_constraint(impl, uq_def, conn_table)
+                _make_unique_constraint(
+                    impl, uq_def, conn_table, column_renames
+                )
                 for uq_def in conn_uniques_reflected
             }
 
         conn_indexes = {
             index
             for index in (
-                _make_index(impl, ix, conn_table)
+                _make_index(impl, ix, conn_table, column_renames)
                 for ix in conn_indexes_reflected
             )
             if index is not None
@@ -516,7 +521,10 @@ _IndexColumnSortingOps: Mapping[str, Any] = util.immutabledict(
 
 
 def _make_index(
-    impl: DefaultImpl, params: ReflectedIndex, conn_table: Table
+    impl: DefaultImpl,
+    params: ReflectedIndex,
+    conn_table: Table,
+    column_renames: dict[str, str] | None = None,
 ) -> Index | None:
     exprs: list[Column[Any] | TextClause] = []
     sorting = params.get("column_sorting")
@@ -529,6 +537,8 @@ def _make_index(
             item = text(name)
         else:
             name = col_name
+            if column_renames:
+                col_name = column_renames.get(col_name, col_name)
             item = conn_table.c[col_name]
         if sorting and name in sorting:
             for operator in sorting[name]:
@@ -548,10 +558,20 @@ def _make_index(
 
 
 def _make_unique_constraint(
-    impl: DefaultImpl, params: ReflectedUniqueConstraint, conn_table: Table
+    impl: DefaultImpl,
+    params: ReflectedUniqueConstraint,
+    conn_table: Table,
+    column_renames: dict[str, str] | None = None,
 ) -> UniqueConstraint:
+    if column_renames:
+        column_names = [
+            column_renames.get(cname, cname)
+            for cname in params["column_names"]
+        ]
+    else:
+        column_names = list(params["column_names"])
     uq = sa_schema.UniqueConstraint(
-        *[conn_table.c[cname] for cname in params["column_names"]],
+        *[conn_table.c[cname] for cname in column_names],
         name=params["name"],
         **impl.adjust_reflected_dialect_options(params, "unique_constraint"),
     )
@@ -562,7 +582,9 @@ def _make_unique_constraint(
 
 
 def _make_foreign_key(
-    params: ReflectedForeignKeyConstraint, conn_table: Table
+    params: ReflectedForeignKeyConstraint,
+    conn_table: Table,
+    autogen_context: AutogenContext | None = None,
 ) -> ForeignKeyConstraint:
     tname = params["referred_table"]
     if params["referred_schema"]:
@@ -570,9 +592,32 @@ def _make_foreign_key(
 
     options = params.get("options", {})
 
+    if autogen_context is not None:
+        # apply validated column renames so that foreign keys spanning
+        # renamed columns compare by their new column identities; this
+        # includes composite foreign keys, whose column lists are
+        # translated element by element.
+        local_renames = autogen_context._column_renames_for_table(
+            conn_table.schema, conn_table.name
+        )
+        referred_renames = autogen_context._column_renames_for_table(
+            params["referred_schema"], params["referred_table"]
+        )
+    else:
+        local_renames = referred_renames = {}
+
+    constrained_columns = [
+        local_renames.get(cname, cname)
+        for cname in params["constrained_columns"]
+    ]
+    referred_columns = [
+        referred_renames.get(cname, cname)
+        for cname in params["referred_columns"]
+    ]
+
     const = sa_schema.ForeignKeyConstraint(
-        [conn_table.c[cname] for cname in params["constrained_columns"]],
-        ["%s.%s" % (tname, n) for n in params["referred_columns"]],
+        [conn_table.c[cname] for cname in constrained_columns],
+        ["%s.%s" % (tname, n) for n in referred_columns],
         onupdate=options.get("onupdate"),
         ondelete=options.get("ondelete"),
         deferrable=options.get("deferrable"),
@@ -598,9 +643,7 @@ def _make_foreign_key(
             ),
             *[
                 sa_schema.Column(remote, conn_table.c[local].type)
-                for local, remote in zip(
-                    params["constrained_columns"], params["referred_columns"]
-                )
+                for local, remote in zip(constrained_columns, referred_columns)
             ],
             info={"alembic_placeholder": True},
         )
@@ -609,9 +652,7 @@ def _make_foreign_key(
     ):
         # table exists and is a placeholder; ensure needed columns are present
         placeholder_table = conn_table.metadata.tables[remote_table_key]
-        for local, remote in zip(
-            params["constrained_columns"], params["referred_columns"]
-        ):
+        for local, remote in zip(constrained_columns, referred_columns):
             if remote not in placeholder_table.c:
                 placeholder_table.append_column(
                     sa_schema.Column(remote, conn_table.c[local].type)
@@ -658,7 +699,8 @@ def _compare_foreign_keys(
     ]
 
     conn_fks = {
-        _make_foreign_key(const, conn_table) for const in conn_fks_list
+        _make_foreign_key(const, conn_table, autogen_context)
+        for const in conn_fks_list
     }
 
     impl = autogen_context.migration_context.impl

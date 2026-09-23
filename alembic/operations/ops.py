@@ -1711,8 +1711,28 @@ class AlterColumnOp(AlterTableOp):
         self.kw = kw
 
     def to_diff_tuple(self) -> Any:
-        col_diff = []
+        col_diff: list[Any] = []
         schema, tname, cname = self.schema, self.table_name, self.column_name
+
+        if self.modify_name is not None:
+            col_diff.append(
+                (
+                    "modify_name",
+                    schema,
+                    tname,
+                    cname,
+                    {
+                        "existing_type": self.existing_type,
+                        "existing_nullable": self.existing_nullable,
+                        "existing_server_default": (
+                            self.existing_server_default
+                        ),
+                        "existing_comment": self.existing_comment,
+                    },
+                    self.column_name,
+                    self.modify_name,
+                )
+            )
 
         if self.modify_type is not None:
             col_diff.append(
@@ -1796,6 +1816,7 @@ class AlterColumnOp(AlterTableOp):
             or self.modify_server_default is not False
             or self.modify_type is not None
             or self.modify_comment is not False
+            or self.modify_name is not None
         )
         if hc1:
             return True
@@ -1833,8 +1854,14 @@ class AlterColumnOp(AlterTableOp):
                 kw["existing_%s" % k] = kw["modify_%s" % k]
                 kw["modify_%s" % k] = swap
 
+        if self.modify_name is not None:
+            kw["modify_name"] = self.column_name
+            column_name = self.modify_name
+        else:
+            column_name = self.column_name
+
         return self.__class__(
-            self.table_name, self.column_name, schema=self.schema, **kw
+            self.table_name, column_name, schema=self.schema, **kw
         )
 
     @classmethod

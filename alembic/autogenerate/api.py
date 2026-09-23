@@ -17,6 +17,8 @@ from ..runtime.plugins import Plugin
 from ..util import sqla_compat
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from sqlalchemy.engine import Connection
     from sqlalchemy.engine import Dialect
     from sqlalchemy.engine import Inspector
@@ -329,6 +331,18 @@ class AutogenContext:
 
     comparators: PriorityDispatcher
 
+    column_renames: (
+        Mapping[tuple[str | None, str, str] | tuple[str, str], str] | None
+    )
+    """Optional column rename mapping used by autogenerate.
+
+    This is the value of the
+    :paramref:`.EnvironmentContext.configure.column_renames` parameter.
+    Keys are ``(schema, table_name, old_column_name)`` tuples (a
+    ``(table_name, old_column_name)`` two-tuple is also accepted and
+    implies the default schema) and values are the new column names.
+    """
+
     def __init__(
         self,
         migration_context: MigrationContext,
@@ -399,6 +413,21 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+        self.column_renames = opts.get("column_renames", None)
+        self._validated_column_renames: dict[
+            tuple[str | None, str], dict[str, str]
+        ] = {}
+
+    def _column_renames_for_table(
+        self, schema: str | None, tname: str
+    ) -> dict[str, str]:
+        """Return the validated ``{old_name: new_name}`` rename mapping
+        in effect for a single table, or an empty dict."""
+        if not self._validated_column_renames:
+            return {}
+        if schema is not None and schema == self.dialect.default_schema_name:
+            schema = None
+        return self._validated_column_renames.get((schema, tname), {})
 
     @util.memoized_property
     def inspector(self) -> Inspector:
