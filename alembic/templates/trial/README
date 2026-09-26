@@ -1,0 +1,1 @@
+Trial-run configuration; migrations run against a caller-supplied connection to a temporary database copy.
