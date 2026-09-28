@@ -1,0 +1,13 @@
+.. change::
+    :tags: feature, ops
+
+    Added :func:`.analyze_ops`, a read-only reporting interface in the new
+    :mod:`alembic.operations.risk` module.  Given an :class:`.UpgradeOps` or
+    :class:`.DowngradeOps` object, it walks the operation tree (including
+    nested :class:`.ModifyTableOps`) and reports table drops, column drops,
+    string length shortening and nullable-to-not-nullable column changes
+    without executing or mutating the operations.  Records that cannot be
+    decided from the operation object alone, such as a missing
+    ``existing_type`` or ``existing_nullable``, are marked as "无法判断"
+    instead of being guessed from database state.  The report is advisory
+    only; the operation tree and generated SQL are unchanged.
