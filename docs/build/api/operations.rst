@@ -164,6 +164,46 @@ The built-in operation objects are listed below.
 .. automodule:: alembic.operations.ops
     :members:
 
+.. _operation_risk_analysis:
+
+Operation Tree Risk Analysis
+==============================
+
+.. versionadded:: 1.20.1
+
+The :func:`.analyze_risks` function provides a read-only report of
+operations in an existing :class:`.UpgradeOps` or :class:`.DowngradeOps`
+tree that may need extra care before deployment:
+
+* dropping a table or a column;
+* shortening the length of a string column;
+* changing a column from nullable to not nullable.
+
+Only information already carried by the operation objects is used.
+When an operation omits, for example, its ``existing_type`` or
+``existing_nullable``, the returned :class:`.RiskRecord` is flagged with
+``determinable=False`` and the reason ``"无法判断"`` instead of guessing
+from database state.  The tree is neither modified nor executed, and a
+reported risk does not forbid the operation::
+
+    from alembic.operations.risks import analyze_risks
+
+    risks = analyze_risks(upgrade_ops)
+    for risk in risks:
+        print(
+            risk.risk_type,
+            risk.table_name,
+            risk.column_name,
+            risk.location,
+            risk.reason,
+        )
+
+A database-free demonstration is available via
+``python -m alembic.operations``.
+
+.. automodule:: alembic.operations.risks
+    :members:
+
 .. _operations_extending_builtin:
 
 Extending Existing Operations

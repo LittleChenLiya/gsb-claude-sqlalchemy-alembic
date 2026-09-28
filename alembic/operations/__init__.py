@@ -4,6 +4,8 @@ from .base import BatchOperations
 from .base import Operations
 from .ops import MigrateOperation
 from .ops import MigrationScript
+from .risks import RiskRecord
+from .risks import analyze_risks
 
 __all__ = [
     "AbstractOperations",
@@ -11,4 +13,6 @@ __all__ = [
     "BatchOperations",
     "MigrateOperation",
     "MigrationScript",
+    "RiskRecord",
+    "analyze_risks",
 ]

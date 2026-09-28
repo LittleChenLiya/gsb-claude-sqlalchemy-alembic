@@ -1,0 +1,14 @@
+.. change::
+    :tags: feature, operations
+
+    Added :func:`.analyze_risks`, a read-only reporting function that
+    walks an existing :class:`.UpgradeOps` or :class:`.DowngradeOps`
+    operation tree and returns :class:`.RiskRecord` entries for
+    potentially destructive operations: dropping a table, dropping a
+    column, shortening a string column's length, and changing a column
+    from nullable to not nullable.  Analysis uses only the data present
+    on the operation objects; missing ``existing_type`` or
+    ``existing_nullable`` information is reported as an undeterminable
+    risk instead of inspecting the database.  The operation tree is
+    never modified or executed, and a reported risk does not prevent
+    the operation.
