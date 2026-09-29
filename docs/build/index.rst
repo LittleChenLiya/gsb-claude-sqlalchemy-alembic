@@ -12,6 +12,7 @@ with the `SQLAlchemy <https://www.sqlalchemy.org>`_ Database Toolkit for Python.
    tutorial
    autogenerate
    offline
+   trial
    naming
    batch
    branches
