@@ -164,6 +164,77 @@ The built-in operation objects are listed below.
 .. automodule:: alembic.operations.ops
     :members:
 
+.. _operations_rewrite:
+
+Rewriting Operation Trees
+=========================
+
+.. versionadded:: 1.17
+
+The :mod:`alembic.operations.rewrite` module provides a database-free way
+to rename the *logical* table name referenced by an already-generated
+operation tree, such as the :class:`.UpgradeOps` / :class:`.DowngradeOps`
+containers produced by autogenerate.  For example, a migration generated
+against ``sales.orders`` can be retargeted to ``sales.purchases`` before
+it is rendered or invoked, while operations against ``public.orders``
+are left alone: the ``(table_name, schema)`` pair is treated as the
+table's identity.
+
+The API has two halves: a **read-only plan**,
+:class:`~alembic.operations.rewrite.RenameTablePlan`, which scans an
+existing tree without modifying it and reports every reference that would
+be retargeted, and a **replica apply** step,
+:meth:`~alembic.operations.rewrite.RenameTablePlan.apply`, which returns
+a *new* operation tree with the rename applied.  The original tree, its
+operation objects and their ``.info`` dictionaries are never mutated.
+
+The rewriter supports add/drop column, create/drop index, and foreign key
+operations (including :class:`.DropConstraintOp`), and traverses the
+:class:`.UpgradeOps`, :class:`.DowngradeOps`, :class:`.ModifyTableOps` and
+:class:`.MigrationScript` containers recursively.  Any other operation -
+including custom :class:`.MigrateOperation` subclasses - may reference
+the renamed table in ways the rewriter cannot see, so the whole batch is
+rejected with
+:class:`~alembic.operations.rewrite.UnsupportedOperationError`; no
+half-renamed tree is ever produced.
+
+Example
+-------
+
+Planning and applying a rename requires no database connection, and the
+:func:`~alembic.operations.rewrite.format_op_tree` helper prints any
+operation tree for inspection::
+
+    from sqlalchemy import Column, Integer
+    from alembic.operations.ops import (
+        AddColumnOp, CreateIndexOp, UpgradeOps,
+    )
+    from alembic.operations.rewrite import RenameTablePlan, format_op_tree
+
+    upgrade_ops = UpgradeOps(
+        ops=[
+            AddColumnOp("orders", Column("total", Integer), schema="sales"),
+            CreateIndexOp("ix_orders_total", "orders", ["total"],
+                          schema="sales"),
+        ]
+    )
+
+    plan = RenameTablePlan(upgrade_ops, "orders", "purchases", schema="sales")
+    for change in plan.changes:          # read-only view of what will move
+        print(change.kind, change.path)
+
+    new_ops = plan.apply()               # a replica; upgrade_ops is untouched
+    print(format_op_tree(new_ops))
+
+producing::
+
+    UpgradeOps(token='upgrades')
+      AddColumnOp(table=sales.purchases, column='total')
+      CreateIndexOp(index='ix_orders_total', table=sales.purchases, columns=['total'])
+
+.. automodule:: alembic.operations.rewrite
+    :members:
+
 .. _operations_extending_builtin:
 
 Extending Existing Operations
