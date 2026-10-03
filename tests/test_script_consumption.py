@@ -1040,7 +1040,11 @@ class RecursiveScriptDirectoryTest(TestBase):
             ]
         )
 
-        with expect_raises_message(KeyError, revision_to_remove.revision):
+        with expect_raises_message(
+            util.CommandError,
+            "Revision %s referenced from .* is not present"
+            % revision_to_remove.revision,
+        ):
             list(sd.walk_revisions())
 
     def test_multiple_dir_recursive(self, multi_base_fixture):

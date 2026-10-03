@@ -1745,3 +1745,73 @@ a docstring is also recommended as it will show up in the help output of the CLI
 
     $ python -m myalembic frobnicate 42
     Revision 42 successfully frobnicated.
+
+Selecting Revisions and Printing Dependency Reasons
+====================================================
+
+When maintaining multiple branches, it is often useful to select a set of
+revisions and their ancestors, and to understand *why* each revision was
+pulled into the selection.  The :meth:`.RevisionMap.select_revisions`
+method provides a read-only way to do this.
+
+Given a target revision, it computes the full dependency closure and
+returns the revisions in a stable topological order (ancestors before
+descendants) along with reason edges.  Each reason edge records whether
+the dependency came from ``down_revision`` or ``depends_on``.
+
+The :meth:`.RevisionSelection.format` method returns a printable string
+showing the selection and the reasons::
+
+    from alembic.script.revision import Revision, RevisionMap
+
+    map_ = RevisionMap(lambda: [
+        Revision("a", ()),
+        Revision("b", ("a",)),
+        Revision("c", ("a",)),
+        Revision("d", ("b",), dependencies=("c",)),
+    ])
+
+    selection = map_.select_revisions("d")
+    print(selection.format())
+
+This prints::
+
+    Targets: d
+    Selected revisions (topological order):
+      a  (down_revision of c; down_revision of b)
+      c  (depends_on of d)
+      b  (down_revision of d)
+      d  (target)
+
+The ``a`` revision is selected because both ``b`` and ``c`` reference it
+via ``down_revision``; ``c`` is selected because ``d`` references it via
+``depends_on``; and ``b`` is selected because ``d`` references it via
+``down_revision``.  The ``d`` revision is the target itself.
+
+Selecting by a branch label produces the exact same closure as selecting
+by the revision id, because branch labels are resolved through the
+existing resolution machinery rather than compared as plain strings::
+
+    by_id = map_.select_revisions("d")
+    by_label = map_.select_revisions("dhead")
+    assert by_id.revisions == by_label.revisions
+
+Duplicate targets are merged automatically, so selecting ``("d", "d")``
+produces the same result as selecting ``"d"``.
+
+Use the ``exclude`` parameter to name revisions that must not appear in
+the selection.  If an excluded revision is a necessary ancestor of any
+target, :class:`.SelectionConflictError` is raised rather than silently
+dropping the dependency::
+
+    from alembic.script.revision import SelectionConflictError
+
+    try:
+        map_.select_revisions("d", exclude="a")
+    except SelectionConflictError as err:
+        print(err)
+        # Excluded revision a is required by target(s) d
+
+Missing revisions and dependency cycles raise clear errors, so problems
+in the revision graph are reported explicitly rather than producing an
+incomplete or incorrect selection.

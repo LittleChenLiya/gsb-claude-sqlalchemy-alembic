@@ -10,6 +10,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Deque
+from typing import NamedTuple
 from typing import Optional
 from typing import overload
 from typing import Protocol
@@ -116,6 +117,45 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
 
     def __init__(self, revision: Sequence[str]) -> None:
         super().__init__(revision)
+
+
+class SelectionConflictError(RevisionError):
+    """An excluded revision is required by the selected targets.
+
+    Raised by :meth:`.RevisionMap.select_revisions` when a revision passed
+    to ``exclude`` is an ancestor of one or more selected targets.  Rather
+    than silently dropping the excluded revision from the dependency
+    closure, the conflict is reported so the caller can resolve it.
+
+    """
+
+    def __init__(
+        self,
+        conflicts: Sequence[tuple[Revision, Sequence[str]]],
+    ) -> None:
+        self.conflicts = conflicts
+        lines = []
+        for rev, required_by in conflicts:
+            lines.append(
+                "Excluded revision %s is required by target(s) %s"
+                % (rev.revision, ", ".join(required_by))
+            )
+        super().__init__("; ".join(lines))
+
+
+class SelectionEdge(NamedTuple):
+    """A reason edge explaining why a revision was selected.
+
+    An edge from ``referrer`` to ``referred`` with ``reason`` of
+    ``"down_revision"`` or ``"depends_on"`` indicates that ``referrer``
+    references ``referred`` via its ``down_revision`` or ``depends_on``
+    marker, and so ``referred`` was pulled into the selection closure.
+
+    """
+
+    referrer: str
+    referred: str
+    reason: str
 
 
 class RevisionMap:
@@ -233,9 +273,9 @@ class RevisionMap:
         for rev in map_.values():
             for downrev in rev._all_down_revisions:
                 if downrev not in map_:
-                    util.warn(
+                    raise RevisionError(
                         "Revision %s referenced from %s is not present"
-                        % (downrev, rev)
+                        % (downrev, rev.revision)
                     )
                 down_revision = map_[downrev]
                 down_revision.add_nextrev(rev)
@@ -369,9 +409,14 @@ class RevisionMap:
 
         for revision in revisions:
             if revision.dependencies:
-                deps = [
-                    map_[dep] for dep in util.to_tuple(revision.dependencies)
-                ]
+                deps = []
+                for dep in util.to_tuple(revision.dependencies):
+                    if dep not in map_:
+                        raise RevisionError(
+                            "Dependency %s referenced from %s is not present"
+                            % (dep, revision.revision)
+                        )
+                    deps.append(map_[dep])
                 revision._resolved_dependencies = tuple(
                     [d.revision for d in deps if d is not None]
                 )
@@ -447,9 +492,9 @@ class RevisionMap:
 
         for downrev in revision._all_down_revisions:
             if downrev not in map_:
-                util.warn(
+                raise RevisionError(
                     "Revision %s referenced from %s is not present"
-                    % (downrev, revision)
+                    % (downrev, revision.revision)
                 )
             not_none(map_[downrev]).add_nextrev(revision)
 
@@ -1527,6 +1572,173 @@ class RevisionMap:
         )
         return self._filter_into_branch_heads(top_revs)
 
+    def select_revisions(
+        self,
+        targets: _GetRevArg,
+        exclude: _GetRevArg | None = None,
+    ) -> RevisionSelection:
+        """Select revisions and their ancestors in a stable topological order.
+
+        This is a read-only operation that does not modify the revision map.
+        Given one or more target revision identifiers, it computes the full
+        dependency closure (ancestors reachable via ``down_revision`` or
+        ``depends_on``) and returns the revisions in a stable topological
+        order (ancestors before descendants) along with reason edges that
+        explain why each revision was pulled into the selection.
+
+        :param targets: a single revision identifier or a sequence of
+            identifiers.  Identifiers may be revision ids, branch labels,
+            partial ids, or the symbolic names ``"head"`` / ``"heads"``.
+            Duplicate targets are merged (deduplicated) automatically.
+        :param exclude: optional single identifier or sequence of
+            identifiers naming revisions that must not appear in the
+            selection.  If an excluded revision is a necessary ancestor of
+            any target, :class:`.SelectionConflictError` is raised rather
+            than silently dropping the dependency.
+
+        :return: a :class:`.RevisionSelection` object.
+
+        .. seealso::
+
+            :meth:`.RevisionSelection.format` -- printable output of the
+            selection and its reasons.
+
+        """
+        target_revs = self._resolve_selection_identifiers(targets)
+        if not target_revs:
+            raise RevisionError(
+                "No revisions were selected from target identifier(s): %r"
+                % (targets,)
+            )
+
+        excluded_revs = (
+            self._resolve_selection_identifiers(exclude) if exclude else ()
+        )
+
+        selected, edges = self._compute_selection_closure(target_revs)
+
+        self._check_selection_conflicts(selected, target_revs, excluded_revs)
+
+        # ``_topological_sort`` emits heads first (descendants before
+        # ancestors), which is the order used by ``iterate_revisions``.  For
+        # a selection we want the reverse: ancestors before descendants.
+        ordered_ids = list(
+            reversed(
+                self._topological_sort(
+                    [self._revision_map[rid] for rid in selected],
+                    list(target_revs),
+                )
+            )
+        )
+
+        return RevisionSelection(
+            targets=target_revs,
+            excluded=excluded_revs,
+            revisions=tuple(self._revision_map[rid] for rid in ordered_ids),
+            edges=edges,
+        )
+
+    def _resolve_selection_identifiers(
+        self, identifiers: _GetRevArg | None
+    ) -> tuple[Revision, ...]:
+        """Resolve selection identifiers to deduplicated Revision objects.
+
+        Branch labels and symbolic names are resolved through the existing
+        :meth:`.RevisionMap.get_revisions` machinery, never compared as
+        plain revision strings.
+
+        """
+        revs = self.get_revisions(identifiers)
+        seen: set[str] = set()
+        result: list[Revision] = []
+        for rev in revs:
+            if rev is None:
+                continue
+            if rev.revision not in seen:
+                seen.add(rev.revision)
+                result.append(rev)
+        return tuple(result)
+
+    def _compute_selection_closure(
+        self, targets: Sequence[Revision]
+    ) -> tuple[dict[str, Revision], list[SelectionEdge]]:
+        """Compute the dependency closure of the given targets.
+
+        Follows ``down_revision`` and ``depends_on`` edges, collecting
+        reason edges.  Raises a clear error if a referenced revision is
+        missing or if a dependency cycle is encountered.
+
+        """
+        selected: dict[str, Revision] = {}
+        edges: list[SelectionEdge] = []
+        edge_keys: set[tuple[str, str, str]] = set()
+        gray: set[str] = set()
+        # Stack entries: (revision, processed_flag).  The processed flag
+        # lets us tell a node whose children have all been visited (safe to
+        # pop) apart from a node that is still on the recursion stack (a
+        # back-edge here means a cycle).
+        todo: Deque[tuple[Revision, bool]] = collections.deque()
+        for target in targets:
+            todo.append((target, False))
+
+        while todo:
+            rev, processed = todo.pop()
+            rev_id = rev.revision
+            if processed:
+                gray.discard(rev_id)
+                continue
+            if rev_id in gray:
+                raise CycleDetected([rev_id])
+            if rev_id in selected:
+                continue
+            gray.add(rev_id)
+            selected[rev_id] = rev
+            todo.append((rev, True))
+            for downrev in rev._normalized_down_revisions:
+                if downrev not in self._revision_map:
+                    raise RevisionError(
+                        "Revision %s referenced from %s is not present"
+                        % (downrev, rev.revision)
+                    )
+                down_rev = self._revision_map[downrev]
+                assert down_rev is not None
+                if downrev in util.to_tuple(rev.down_revision, default=()):
+                    reason = "down_revision"
+                else:
+                    reason = "depends_on"
+                edge = SelectionEdge(rev_id, downrev, reason)
+                edge_key = (rev_id, downrev, reason)
+                if edge_key not in edge_keys:
+                    edge_keys.add(edge_key)
+                    edges.append(edge)
+                todo.append((down_rev, False))
+        return selected, edges
+
+    def _check_selection_conflicts(
+        self,
+        selected: dict[str, Revision],
+        targets: Sequence[Revision],
+        excluded: Sequence[Revision],
+    ) -> None:
+        """Raise if any excluded revision is a necessary ancestor."""
+        conflicts: list[tuple[Revision, list[str]]] = []
+        for ex in excluded:
+            if ex.revision in selected:
+                required_by = [
+                    t.revision
+                    for t in targets
+                    if ex.revision
+                    in {
+                        r.revision
+                        for r in self._get_ancestor_nodes(
+                            [t], include_dependencies=True
+                        )
+                    }
+                ]
+                conflicts.append((ex, required_by))
+        if conflicts:
+            raise SelectionConflictError(conflicts)
+
 
 class Revision:
     """Base class for revisioned objects.
@@ -1693,6 +1905,84 @@ class Revision:
         """Return True if this :class:`.Script` is a merge point."""
 
         return len(self._versioned_down_revisions) > 1
+
+
+class RevisionSelection:
+    """Result of a read-only revision selection.
+
+    Returned by :meth:`.RevisionMap.select_revisions`, this object holds
+    the selected revisions in a stable topological order (ancestors before
+    descendants) along with reason edges that explain why each revision was
+    pulled into the selection.
+
+    Attributes:
+        targets: tuple of resolved target :class:`.Revision` objects,
+            deduplicated while preserving order.
+        excluded: tuple of resolved excluded :class:`.Revision` objects.
+        revisions: tuple of selected :class:`.Revision` objects in stable
+            topological order.
+        edges: tuple of :class:`.SelectionEdge` objects explaining the
+            dependency relationships within the selection.
+
+    """
+
+    def __init__(
+        self,
+        targets: Sequence[Revision],
+        excluded: Sequence[Revision],
+        revisions: Sequence[Revision],
+        edges: Sequence[SelectionEdge],
+    ) -> None:
+        self.targets = tuple(targets)
+        self.excluded = tuple(excluded)
+        self.revisions = tuple(revisions)
+        self.edges = tuple(edges)
+
+    def reason_for(self, revision: Revision | str) -> tuple[SelectionEdge, ...]:
+        """Return the reason edges that explain why ``revision`` was selected.
+
+        :param revision: a :class:`.Revision` object or its string revision
+            identifier.
+
+        :return: tuple of :class:`.SelectionEdge` objects where
+            :attr:`.SelectionEdge.referred` equals ``revision``.
+
+        """
+        rev_id = revision.revision if isinstance(revision, Revision) else revision
+        return tuple(edge for edge in self.edges if edge.referred == rev_id)
+
+    def format(self) -> str:
+        """Return a printable string showing the selection and reasons.
+
+        The output lists the targets, any excluded revisions, and each
+        selected revision in topological order with the reason(s) it was
+        selected.  A revision that is a target itself is labeled
+        ``(target)``; every other revision shows the ``down_revision`` or
+        ``depends_on`` edge that pulled it into the closure.
+
+        """
+        lines = ["Targets: %s" % ", ".join(r.revision for r in self.targets)]
+        if self.excluded:
+            lines.append(
+                "Excluded: %s" % ", ".join(r.revision for r in self.excluded)
+            )
+        lines.append("Selected revisions (topological order):")
+        for rev in self.revisions:
+            reasons = self.reason_for(rev)
+            if reasons:
+                reason_str = "; ".join(
+                    "%s of %s" % (edge.reason, edge.referrer) for edge in reasons
+                )
+                lines.append("  %s  (%s)" % (rev.revision, reason_str))
+            else:
+                lines.append("  %s  (target)" % rev.revision)
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return "RevisionSelection(targets=%r, revisions=%r)" % (
+            [r.revision for r in self.targets],
+            [r.revision for r in self.revisions],
+        )
 
 
 @overload
