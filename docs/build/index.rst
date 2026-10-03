@@ -16,6 +16,7 @@ with the `SQLAlchemy <https://www.sqlalchemy.org>`_ Database Toolkit for Python.
    batch
    branches
    ops
+   boundary
    cookbook
    api/index
    changelog
