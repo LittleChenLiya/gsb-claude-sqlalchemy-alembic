@@ -17,6 +17,7 @@ with the `SQLAlchemy <https://www.sqlalchemy.org>`_ Database Toolkit for Python.
    branches
    ops
    cookbook
+   table_rename
    api/index
    changelog
 
