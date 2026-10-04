@@ -1,0 +1,18 @@
+.. change::
+    :tags: feature, autogenerate
+    :tickets: 1867
+
+    Added :meth:`.Rewriter.scope`, a context manager that provides a
+    temporary registration scope for a :class:`.Rewriter`.  Rewrite rules
+    registered within the scope override those registered normally, and
+    the original rules are restored when the scope is exited, including
+    when an exception is raised.  Nested scopes are restored in LIFO order.
+    The scope is local to the :class:`.Rewriter` instance, so rewrite
+    rules registered within it are not visible to other
+    :class:`.Rewriter` instances.
+
+    Additionally, the processed-marker that :class:`.Rewriter` uses to
+    avoid processing the same directive more than once is now scoped to a
+    single invocation, so that a second traversal of the same operation
+    tree will still apply the current rewrite rules rather than being
+    skipped.

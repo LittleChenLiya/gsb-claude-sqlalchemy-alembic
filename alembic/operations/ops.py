@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.selectable import TableClause
     from sqlalchemy.sql.type_api import TypeEngine
 
-    from ..autogenerate.rewriter import Rewriter
     from ..ddl.base import _ServerDefaultArgument
     from ..runtime.migration import MigrationContext
     from ..script.revision import _RevIdType
@@ -74,7 +73,7 @@ class MigrateOperation:
         """
         return {}
 
-    _mutations: frozenset[Rewriter] = frozenset()
+    _mutations: frozenset[Any] = frozenset()
 
     def reverse(self) -> MigrateOperation:
         raise NotImplementedError

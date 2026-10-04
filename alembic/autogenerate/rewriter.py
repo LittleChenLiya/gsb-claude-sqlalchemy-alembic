@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from typing import Callable
 from typing import TYPE_CHECKING
@@ -58,6 +59,74 @@ class Rewriter:
 
     def __init__(self) -> None:
         self.dispatch = util.Dispatcher()
+        self._dispatch_stack: list[util.Dispatcher] = []
+        self._mutation_token: object | None = None
+
+    @contextmanager
+    def scope(self) -> Iterator[Rewriter]:
+        """Context manager providing a temporary registration scope.
+
+        A :class:`.Rewriter` may be placed into a temporary scope, within
+        which rewrite rules may be registered that override those registered
+        normally.  When the scope is exited, the original rules are restored.
+        Nested scopes are restored in LIFO order, and a scope is restored
+        even if an exception is raised within it.
+
+        E.g.::
+
+            writer = autogenerate.Rewriter()
+
+            @writer.rewrites(ops.AddColumnOp)
+            def mark_column(context, revision, op):
+                op.column.name = "A"
+                return op
+
+            with writer.scope():
+                @writer.rewrites(ops.AddColumnOp)
+                def mark_column_temporarily(context, revision, op):
+                    op.column.name = "B"
+                    return op
+
+                # within the scope, "B" is applied
+                writer(context, revision, directives)
+
+            # outside the scope, "A" is applied again
+            writer(context, revision, directives)
+
+        The scope is local to this :class:`.Rewriter` instance; rewrite
+        rules registered within it are not visible to other
+        :class:`.Rewriter` instances, including those that have already
+        been created.
+
+        .. seealso::
+
+            :ref:`autogen_rewriter` - usage example
+
+        """
+        self._dispatch_stack.append(util.Dispatcher())
+        try:
+            yield self
+        finally:
+            self._dispatch_stack.pop()
+
+    @property
+    def _active_dispatch(self) -> util.Dispatcher:
+        """Return the dispatcher that is currently active.
+
+        This is the dispatcher at the top of the temporary scope stack,
+        or the base dispatcher if no scope is active.
+
+        """
+        if self._dispatch_stack:
+            return self._dispatch_stack[-1]
+        return self.dispatch
+
+    def _all_dispatchers(self) -> Iterator[util.Dispatcher]:
+        """Iterate over all dispatchers, from the active scope down to
+        the base dispatcher."""
+
+        yield from reversed(self._dispatch_stack)
+        yield self.dispatch
 
     def chain(
         self,
@@ -119,7 +188,7 @@ class Rewriter:
                 return op
 
         """
-        return self.dispatch.dispatch_for(operator)
+        return self._active_dispatch.dispatch_for(operator)
 
     def _rewrite(
         self,
@@ -127,22 +196,27 @@ class Rewriter:
         revision: _GetRevArg,
         directive: MigrateOperation,
     ) -> Iterator[MigrateOperation]:
-        try:
-            _rewriter = self.dispatch.dispatch(directive)
-        except ValueError:
-            _rewriter = None
+        _rewriter: Any = None
+        for dispatcher in self._all_dispatchers():
+            try:
+                _rewriter = dispatcher.dispatch(directive)
+                break
+            except ValueError:
+                continue
+
+        if _rewriter is None:
+            yield directive
+        elif self._mutation_token in directive._mutations:
             yield directive
         else:
-            if self in directive._mutations:
-                yield directive
-            else:
-                for r_directive in util.to_list(
-                    _rewriter(context, revision, directive), []
-                ):
+            for r_directive in util.to_list(
+                _rewriter(context, revision, directive), []
+            ):
+                if self._mutation_token is not None:
                     r_directive._mutations = r_directive._mutations.union(
-                        [self]
+                        [self._mutation_token]
                     )
-                    yield r_directive
+                yield r_directive
 
     def __call__(
         self,
@@ -230,4 +304,8 @@ class Rewriter:
         revision: _GetRevArg,
         directives: list[MigrationScript],
     ) -> None:
-        self._traverse_list(context, revision, directives)
+        self._mutation_token = object()
+        try:
+            self._traverse_list(context, revision, directives)
+        finally:
+            self._mutation_token = None

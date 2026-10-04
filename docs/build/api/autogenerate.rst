@@ -288,6 +288,55 @@ object we care about.
 .. autoclass:: alembic.autogenerate.rewriter.Rewriter
     :members:
 
+.. _autogen_rewriter_scope:
+
+Temporarily Registering Rewrite Rules with Scopes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a one-time migration, it may be useful to temporarily attach a few
+rewrite rules to a :class:`.Rewriter` that override those registered
+normally, and then restore the original rules.  The :meth:`.Rewriter.scope`
+context manager provides a temporary registration scope for this purpose.
+
+Within a scope, rules registered with :meth:`.Rewriter.rewrites` override
+those registered for the same directive type outside of the scope.  When
+the scope is exited, the original rules are restored.  Nested scopes are
+restored in LIFO order, and a scope is restored even if an exception is
+raised within it::
+
+    writer = rewriter.Rewriter()
+
+    @writer.rewrites(ops.AddColumnOp)
+    def mark_column(context, revision, op):
+        op.column.name = "A"
+        return op
+
+    # outside the scope, "A" is applied
+    writer(context, revision, directives)
+
+    with writer.scope():
+        @writer.rewrites(ops.AddColumnOp)
+        def mark_column_temporarily(context, revision, op):
+            op.column.name = "B"
+            return op
+
+        # within the scope, "B" is applied
+        writer(context, revision, directives)
+
+    # outside the scope again, "A" is applied
+    writer(context, revision, directives)
+
+The scope is local to the :class:`.Rewriter` instance, so rewrite rules
+registered within it are not visible to other :class:`.Rewriter` instances,
+including those that have already been created.
+
+The processed-marker that :class:`.Rewriter` uses to avoid processing the
+same directive more than once is scoped to a single invocation.  This means
+that a second traversal of the same operation tree will still apply the
+current rewrite rules rather than being skipped.  This is particularly
+useful within a scope, where the same operation tree may be traversed more
+than once while the temporary rules are in effect.
+
 .. _autogen_customizing_multiengine_revision:
 
 Revision Generation with Multiple Engines / ``run_migrations()`` calls
