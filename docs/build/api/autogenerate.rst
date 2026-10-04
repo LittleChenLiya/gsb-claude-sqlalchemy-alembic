@@ -284,6 +284,70 @@ and ``MigrationScript->DowngradeOps->ModifyTableOps``.   The
 as rewriting them as needed so that we only need to code for the specific
 object we care about.
 
+Temporary Rewrite Rules with Scopes
+===================================
+
+A one-off tool, such as a data migration script that reuses the same
+:class:`.Rewriter` for several different passes, may want to install
+rewrite rules only for the duration of a single section of code without
+altering the rules that were permanently registered on the
+:class:`.Rewriter`.  The :meth:`.Rewriter.scope` context manager provides a
+**local registration scope** for exactly this purpose::
+
+    writer = rewriter.Rewriter()
+
+    @writer.rewrites(ops.AddColumnOp)
+    def add_column(context, revision, op):
+        op.column.name = op.column.name + "_default"
+        return op
+
+    with writer.scope() as temporary:
+
+        @temporary.rewrites(ops.AddColumnOp)
+        def add_column_for_one_off_tool(context, revision, op):
+            op.column.name = op.column.name + "_one_off"
+            return op
+
+        # traversals inside the block use add_column_for_one_off_tool
+        process_revision_directives = writer
+
+    # leaving the block restores add_column
+
+Scopes behave as follows:
+
+* Rules registered through the scope object use the same
+  :meth:`~.Rewriter.rewrites` style decorator, but only live for the
+  duration of the ``with`` block.  When the block is exited, the rules
+  that were active before the block are restored.
+
+* Scopes can be **nested**.  Each inner scope sees the rules of all
+  enclosing scopes, and on exit the rules are restored in
+  last-in/first-out order.
+
+* Registering a temporary rule for a directive **type** overrides, within
+  the current scope only, whatever rule (permanent or temporary) was
+  previously active for that same type.  Rules registered for other
+  types are unaffected.
+
+* Restoration also happens when the block or a traversal **raises an
+  exception**, so a failed one-off pass can never leave the
+  :class:`.Rewriter` with a half-installed rule set.
+
+* Temporary registrations are local to a single :class:`.Rewriter`
+  object; an independently constructed :class:`.Rewriter` never observes
+  rules installed inside another object's scope.
+
+* The "already processed" markers used while traversing an operation tree
+  are scoped to a single traversal as well.  Traversing the same
+  operation tree a second time runs the currently active rules again
+  instead of silently skipping directives marked during the first
+  traversal.
+
+A runnable demonstration that operates purely on in-memory operation
+objects, without connecting to any database, is included at
+``examples/rewriter_scope_demo/rewriter_scope_demo.py``::
+
+    python examples/rewriter_scope_demo/rewriter_scope_demo.py
 
 .. autoclass:: alembic.autogenerate.rewriter.Rewriter
     :members:

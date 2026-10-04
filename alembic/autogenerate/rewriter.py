@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from typing import Callable
 from typing import TYPE_CHECKING
@@ -24,6 +25,44 @@ if TYPE_CHECKING:
 ProcessRevisionDirectiveFn = Callable[
     ["MigrationContext", "_GetRevArg", list["MigrationScript"]], None
 ]
+
+
+class _ScopedRewriter:
+    """A temporary registration handle returned by :meth:`.Rewriter.scope`.
+
+    The object proxies :meth:`.rewrites` registrations into a private,
+    branched :class:`.Dispatcher` installed on the parent :class:`.Rewriter`
+    for the duration of the ``with`` block.  Registrations made through the
+    scope replace any rule previously registered for the same directive
+    type, including rules inherited from an enclosing scope, while rules of
+    other types remain visible.
+
+    """
+
+    __slots__ = ("_rewriter",)
+
+    def __init__(self, rewriter: Rewriter) -> None:
+        self._rewriter = rewriter
+
+    def rewrites(
+        self,
+        operator: (
+            type[AddColumnOp]
+            | type[MigrateOperation]
+            | type[AlterColumnOp]
+            | type[CreateTableOp]
+            | type[ModifyTableOps]
+        ),
+    ) -> Callable[..., Any]:
+        """Register a temporary rewrite function for a given type.
+
+        Has the same signature as :meth:`.Rewriter.rewrites`.  Unlike a
+        permanent registration, a registration of the same type is allowed
+        and replaces the rule active in the current scope; it is discarded
+        as soon as the scope exits.
+
+        """
+        return self._rewriter.dispatch.dispatch_for(operator, replace=True)
 
 
 class Rewriter:
@@ -58,6 +97,10 @@ class Rewriter:
 
     def __init__(self) -> None:
         self.dispatch = util.Dispatcher()
+        self._scope_stack: list[util.Dispatcher] = []
+        self._active_traversal: list[tuple[MigrateOperation, Any]] | None = (
+            None
+        )
 
     def chain(
         self,
@@ -94,6 +137,9 @@ class Rewriter:
         """
         wr = self.__class__.__new__(self.__class__)
         wr.__dict__.update(self.__dict__)
+        # an active scope on the chained view must not push/pop dispatchers
+        # on the rewriter it was chained from
+        wr._scope_stack = list(self._scope_stack)
         wr._chained += (other,)
         return wr
 
@@ -121,6 +167,55 @@ class Rewriter:
         """
         return self.dispatch.dispatch_for(operator)
 
+    @contextmanager
+    def scope(self) -> Iterator[_ScopedRewriter]:
+        """Open a local registration scope for temporary rewrite rules.
+
+        This is useful for one-off migration tooling that needs to install
+        rewrite rules just for a single, scoped section of code without
+        modifying the permanently registered rules of this
+        :class:`.Rewriter`::
+
+            writer = autogenerate.Rewriter()
+
+            @writer.rewrites(ops.AddColumnOp)
+            def add_column_default(context, revision, op):
+                ...
+
+            with writer.scope() as temporary:
+
+                @temporary.rewrites(ops.AddColumnOp)
+                def add_column_for_one_off_tool(context, revision, op):
+                    ...
+
+                # this traversal uses add_column_for_one_off_tool
+                writer(context, revision, directives)
+
+            # exiting the block restores add_column_default
+
+        Scopes can be nested.  The dispatcher of an inner scope is branched
+        from the one of the immediately enclosing scope, and on exit scopes
+        are restored in last-in/first-out order.  A temporary rule
+        registered for a directive type overrides, only for the duration of
+        that scope, whatever rule (permanent or temporary) was previously
+        active for the same type; rules registered for other types are
+        unaffected.  The previous rules are restored even if the block
+        raises an exception.
+
+        Temporary registrations are per-:class:`.Rewriter` object; they are
+        only visible to the object (and to a :meth:`.chain` derived while
+        the scope is active) on which the scope was opened, never to other
+        independent :class:`.Rewriter` instances.
+
+        """
+        branched = self.dispatch.branch()
+        self._scope_stack.append(self.dispatch)
+        self.dispatch = branched
+        try:
+            yield _ScopedRewriter(self)
+        finally:
+            self.dispatch = self._scope_stack.pop()
+
     def _rewrite(
         self,
         context: MigrationContext,
@@ -139,6 +234,16 @@ class Rewriter:
                 for r_directive in util.to_list(
                     _rewriter(context, revision, directive), []
                 ):
+                    active_traversal = self._active_traversal
+                    if (
+                        active_traversal is not None
+                        and self not in r_directive._mutations
+                    ):
+                        # remember the previous state so that markers added
+                        # by this traversal alone can be removed afterwards
+                        active_traversal.append(
+                            (r_directive, r_directive._mutations)
+                        )
                     r_directive._mutations = r_directive._mutations.union(
                         [self]
                     )
@@ -230,4 +335,19 @@ class Rewriter:
         revision: _GetRevArg,
         directives: list[MigrationScript],
     ) -> None:
-        self._traverse_list(context, revision, directives)
+        # The "_mutations" markers recorded on directives prevent the same
+        # rewriter from processing an emitted directive again within one
+        # traversal.  They are scoped to this traversal only: snapshot every
+        # directive this traversal marks and restore the previous state on
+        # exit, including when an exception is raised, so that a subsequent
+        # traversal (or another :class:`.Rewriter` sharing the directive
+        # tree) does not inherit stale "already processed" markers.
+        previous_traversal = self._active_traversal
+        active_traversal: list[tuple[MigrateOperation, Any]] = []
+        self._active_traversal = active_traversal
+        try:
+            self._traverse_list(context, revision, directives)
+        finally:
+            for directive, previous_mutations in reversed(active_traversal):
+                directive._mutations = previous_mutations
+            self._active_traversal = previous_traversal
