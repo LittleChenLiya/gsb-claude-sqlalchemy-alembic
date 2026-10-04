@@ -795,3 +795,99 @@ If there's any point to be made here, it's if you are too freely branching, merg
 and labeling, things can get pretty crazy!  Hence the branching system should
 be used carefully and thoughtfully for best results.
 
+
+.. _revision_selection:
+
+Selecting Required Ancestors Programmatically
+=============================================
+
+When maintaining several branches it can be useful to ask *which*
+revisions are needed to reach a given target revision, and *why* each one
+was included.  The read-only :meth:`.RevisionMap.select_revisions` method
+returns a :class:`.RevisionSelection` object containing the target
+revisions together with every required ancestor, following both
+``down_revision`` and ``depends_on`` links.
+
+The result is stable:
+
+* :attr:`.RevisionSelection.revisions` and
+  :attr:`.RevisionSelection.revision_ids` list the selected revisions in
+  topological order, with every ancestor placed before its descendants;
+* :attr:`.RevisionSelection.reasons` is a tuple of
+  :class:`.SelectionReason` edges, each stating that ``child`` requires
+  ``parent`` either via ``down_revision`` or via ``depends_on``.
+
+Given the history ``a -> b``, ``a -> c`` with ``c`` declaring
+``depends_on = 'b'``, and ``d`` merging ``b`` and ``c``::
+
+    from alembic.script.revision import Revision, RevisionMap
+
+    revision_map = RevisionMap(
+        lambda: [
+            Revision("a", None, branch_labels="rootbranch"),
+            Revision("b", "a"),
+            Revision("c", "a", dependencies="b"),
+            Revision("d", ("b", "c")),
+        ]
+    )
+
+    selection = revision_map.select_revisions("d")
+
+    print(selection.revision_ids)
+    # ('a', 'b', 'c', 'd')
+
+    for reason in selection.reasons:
+        print(reason.child, "requires", reason.parent, "via", reason.reason)
+    # b requires a via down_revision
+    # c requires a via down_revision
+    # c requires b via depends_on
+    # d requires b via down_revision
+    # d requires c via down_revision
+
+The human-readable form is available from
+:meth:`.RevisionSelection.format_reasons` /
+:meth:`.RevisionSelection.print_reasons`::
+
+    >>> selection.print_reasons()
+    a
+    b (requires a via down_revision)
+    c (requires a via down_revision; requires b via depends_on)
+    d (requires b via down_revision; requires c via down_revision; target)
+
+A runnable version of this example is included at
+``examples/select_revisions/select_revisions_demo.py``.
+
+Targets may be given as concrete revision ids, branch labels (in
+``label@revision`` form), :class:`.Revision` objects, or a sequence of
+those.  A branch label is resolved through the revision map rather than
+being compared directly against a concrete revision string, so selecting
+``"rootbranch@d"`` returns exactly the same
+:class:`.RevisionSelection` - the same revision objects and the same
+closure - as selecting ``"d"``.  Repeating a target, or naming it both
+directly and via a label, simply merges into one selection.
+
+Exclusions and error handling
+-----------------------------
+
+``select_revisions()`` never removes a dependency implicitly.  If an
+excluded revision is in fact required by one of the targets,
+:class:`.RequiredRevisionExcluded` is raised and carries the conflicting
+target/excluded pairs together with the requirement path::
+
+    >>> revision_map.select_revisions("d", exclude="a")
+    Traceback (most recent call last):
+    ...
+    alembic.script.revision.RequiredRevisionExcluded: Cannot exclude
+    revision(s) required to reach the target revision(s): 'a' is
+    required by target 'd' (d -> b -> a)
+
+Excluding a revision that would not have been selected anyway is
+allowed.  Unknown target/exclusion identifiers raise
+:class:`.ResolutionError`; a ``down_revision`` or ``depends_on`` that
+points at a missing revision raises :class:`.RevisionReferenceNotFound`;
+and a cyclic revision graph raises :class:`.CycleDetected` or
+:class:`.DependencyCycleDetected`.  The revision map itself is never
+modified.
+
+The same operation is available on a loaded script directory through
+:meth:`.ScriptDirectory.select_revisions`.

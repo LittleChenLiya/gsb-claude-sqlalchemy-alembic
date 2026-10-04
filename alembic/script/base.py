@@ -274,6 +274,22 @@ class ScriptDirectory:
         with self._catch_revision_errors():
             return cast(set[Script], self.revision_map._get_all_current(id_))
 
+    def select_revisions(
+        self,
+        targets: revision._RevSelectionArg,
+        exclude: revision._RevSelectionArg | None = None,
+    ) -> revision.RevisionSelection:
+        """Select target revisions and every revision they require.
+
+        This is a read-only operation.  See
+        :meth:`.RevisionMap.select_revisions` for the full semantics,
+        including the stable topological ordering and the per-revision
+        reason edges (``down_revision`` / ``depends_on``).
+
+        """
+        with self._catch_revision_errors():
+            return self.revision_map.select_revisions(targets, exclude)
+
     def get_revision(self, id_: str) -> Script:
         """Return the :class:`.Script` instance with the given rev id.
 

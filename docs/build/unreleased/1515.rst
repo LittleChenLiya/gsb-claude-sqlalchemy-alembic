@@ -1,0 +1,18 @@
+.. change::
+    :tags: feature, revision
+    :tickets: 1515
+
+    Added a read-only revision selection interface,
+    :meth:`.RevisionMap.select_revisions` (also available as
+    :meth:`.ScriptDirectory.select_revisions`).  Given target revision(s)
+    or branch label(s), it returns a :class:`.RevisionSelection` of every
+    required ancestor in a stable topological order, with a
+    :class:`.SelectionReason` edge for every requirement produced by
+    ``down_revision`` or ``depends_on``.  Duplicate targets are merged;
+    explicitly excluding a required ancestor raises
+    :class:`.RequiredRevisionExcluded` rather than silently dropping the
+    dependency; missing target revisions, missing ``down_revision`` /
+    ``depends_on`` references and cyclic revision graphs each produce a
+    clear, specific error.  A new :class:`.RevisionReferenceNotFound`
+    error is now raised when the revision map references a revision that
+    is not present, instead of an opaque ``KeyError``.

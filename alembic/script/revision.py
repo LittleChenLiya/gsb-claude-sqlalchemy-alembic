@@ -9,6 +9,7 @@ import re
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import ClassVar
 from typing import Deque
 from typing import Optional
 from typing import overload
@@ -33,6 +34,11 @@ _GetRevArg = Union[
 ]
 _RevisionIdentifierType = Union[str, tuple[str, ...], None]
 _RevisionOrStr = Union["Revision", str]
+_RevSelectionArg = Union[
+    str,
+    "Revision",
+    Collection[Union[str, "Revision"]],
+]
 _RevisionOrBase = Union["Revision", "Literal['base']"]
 _InterimRevisionMapType = dict[str, "Revision"]
 _RevisionMapType = dict[Union[None, str, tuple[()]], Optional["Revision"]]
@@ -97,6 +103,52 @@ class CycleDetected(RevisionError):
         )
 
 
+class RevisionReferenceNotFound(ResolutionError):
+    """Raised when a revision references a ``down_revision`` or
+    ``depends_on`` identifier that is not present in the map."""
+
+    def __init__(self, revision: str, missing: str, via: str) -> None:
+        self.missing = missing
+        self.revision = revision
+        super().__init__(
+            "Revision '%s' referenced from revision '%s' via %s is "
+            "not present in the revision map" % (missing, revision, via),
+            missing,
+        )
+
+
+class RequiredRevisionExcluded(RevisionError):
+    """Raised when :meth:`.RevisionMap.select_revisions` is asked to
+    exclude a revision that is a required ancestor of one of the target
+    revisions.
+
+    Alembic refuses to silently drop the dependency; the conflicting
+    selection parameters must be resolved by the caller instead.
+
+    """
+
+    def __init__(
+        self,
+        conflicts: Sequence[tuple[str, str, Sequence[str]]],
+    ) -> None:
+        #: tuple of ``(target_id, excluded_id, path)`` where ``path`` is a
+        #: list of revision ids from the target down to the excluded
+        #: revision, following ``down_revision`` / ``depends_on`` links.
+        self.conflicts = tuple(conflicts)
+        self.excluded = tuple(
+            dict.fromkeys(excluded for _, excluded, _ in conflicts)
+        )
+        details = "; ".join(
+            "'%s' is required by target '%s' (%s)"
+            % (excluded, target, " -> ".join(path))
+            for target, excluded, path in conflicts
+        )
+        super().__init__(
+            "Cannot exclude revision(s) required to reach the target "
+            "revision(s): %s" % details
+        )
+
+
 class DependencyCycleDetected(CycleDetected):
     kind = "Dependency cycle"
 
@@ -116,6 +168,169 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
 
     def __init__(self, revision: Sequence[str]) -> None:
         super().__init__(revision)
+
+
+class SelectionReason:
+    """Describes one reason why a revision was pulled into a
+    :class:`.RevisionSelection`.
+
+    A reason edge runs from a required parent revision to the child
+    revision that requires it.
+
+    """
+
+    down_revision: ClassVar[str] = "down_revision"
+    """The parent is listed in the child's ``down_revision``."""
+
+    depends_on: ClassVar[str] = "depends_on"
+    """The parent is listed in the child's ``depends_on``."""
+
+    __slots__ = ("parent", "child", "reason")
+
+    def __init__(self, parent: str, child: str, reason: str) -> None:
+        self.parent = parent
+        self.child = child
+        self.reason = reason
+
+    def __iter__(self) -> Iterator[str]:
+        yield self.parent
+        yield self.child
+        yield self.reason
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, SelectionReason):
+            return NotImplemented
+        return (
+            self.parent == other.parent
+            and self.child == other.child
+            and self.reason == other.reason
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.parent, self.child, self.reason))
+
+    def __repr__(self) -> str:
+        return (
+            "SelectionReason(parent=%r, child=%r, reason=%r)"
+            % (self.parent, self.child, self.reason)
+        )
+
+
+class RevisionSelection:
+    """The read-only result of :meth:`.RevisionMap.select_revisions`.
+
+    The object does not hold any mutable reference to the
+    :class:`.RevisionMap` state and may be inspected freely.
+
+    """
+
+    __slots__ = (
+        "revisions",
+        "revision_ids",
+        "targets",
+        "reasons",
+        "_reasons_by_child",
+    )
+
+    revisions: tuple[Revision, ...]
+    """The selected revisions in stable topological order, ancestors first
+    (i.e. the order in which migrations would be applied)."""
+
+    revision_ids: tuple[str, ...]
+    """The string ids of :attr:`.revisions`, in the same order."""
+
+    targets: tuple[Revision, ...]
+    """The revisions explicitly requested as targets (de-duplicated)."""
+
+    reasons: tuple[SelectionReason, ...]
+    """Reason edges explaining why each non-target revision was pulled into
+    the selection, in topological order."""
+
+    def __init__(
+        self,
+        revisions: tuple[Revision, ...],
+        targets: tuple[Revision, ...],
+        reasons: tuple[SelectionReason, ...],
+    ) -> None:
+        self.revisions = revisions
+        self.revision_ids = tuple(rev.revision for rev in revisions)
+        self.targets = targets
+        self.reasons = reasons
+
+        by_child: dict[str, list[SelectionReason]] = {}
+        for edge in reasons:
+            by_child.setdefault(edge.child, []).append(edge)
+        self._reasons_by_child = {
+            child: tuple(child_reasons)
+            for child, child_reasons in by_child.items()
+        }
+
+    def reasons_for(
+        self, revision: _RevisionOrStr
+    ) -> tuple[SelectionReason, ...]:
+        """Return the reason edges that caused ``revision`` to be selected.
+
+        An empty tuple means the revision is a base revision (it has no
+        parents), or that it was selected only as a target.
+
+        """
+        rev_id = (
+            revision.revision if isinstance(revision, Revision) else revision
+        )
+        return self._reasons_by_child.get(rev_id, ())
+
+    def format_reasons(self) -> str:
+        """Render a human-readable explanation of the selection.
+
+        Revisions are listed in the same stable topological order as
+        :attr:`.revisions`; target revisions are marked and every reason
+        edge from :attr:`.reasons` is shown.
+
+        """
+        target_ids = {rev.revision for rev in self.targets}
+        lines = []
+        for rev in self.revisions:
+            reasons = self._reasons_by_child.get(rev.revision, ())
+            details = [
+                "requires %s via %s" % (edge.parent, edge.reason)
+                for edge in reasons
+            ]
+            if rev.revision in target_ids:
+                details.append("target")
+            if details:
+                lines.append(
+                    "%s (%s)" % (rev.revision, "; ".join(details))
+                )
+            else:
+                lines.append(rev.revision)
+        return "\n".join(lines)
+
+    def print_reasons(self, file: Any | None = None) -> None:
+        """Print :meth:`.format_reasons` to ``file`` (default stdout)."""
+        print(self.format_reasons(), file=file)
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, RevisionSelection):
+            return NotImplemented
+        return (
+            self.revision_ids == other.revision_ids
+            and [rev.revision for rev in self.targets]
+            == [rev.revision for rev in other.targets]
+            and self.reasons == other.reasons
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "RevisionSelection(revisions=%r, targets=%r, reasons=%r)"
+            % (
+                self.revision_ids,
+                [rev.revision for rev in self.targets],
+                list(self.reasons),
+            )
+        )
+
+    def __str__(self) -> str:
+        return self.format_reasons()
 
 
 class RevisionMap:
@@ -233,9 +448,15 @@ class RevisionMap:
         for rev in map_.values():
             for downrev in rev._all_down_revisions:
                 if downrev not in map_:
-                    util.warn(
-                        "Revision %s referenced from %s is not present"
-                        % (downrev, rev)
+                    raise RevisionReferenceNotFound(
+                        rev.revision,
+                        downrev,
+                        (
+                            "down_revision"
+                            if downrev
+                            in rev._versioned_down_revisions
+                            else "depends_on"
+                        ),
                     )
                 down_revision = map_[downrev]
                 down_revision.add_nextrev(rev)
@@ -369,9 +590,13 @@ class RevisionMap:
 
         for revision in revisions:
             if revision.dependencies:
-                deps = [
-                    map_[dep] for dep in util.to_tuple(revision.dependencies)
-                ]
+                deps = []
+                for dep in util.to_tuple(revision.dependencies):
+                    if dep not in map_:
+                        raise RevisionReferenceNotFound(
+                            revision.revision, dep, "depends_on"
+                        )
+                    deps.append(map_[dep])
                 revision._resolved_dependencies = tuple(
                     [d.revision for d in deps if d is not None]
                 )
@@ -447,9 +672,15 @@ class RevisionMap:
 
         for downrev in revision._all_down_revisions:
             if downrev not in map_:
-                util.warn(
-                    "Revision %s referenced from %s is not present"
-                    % (downrev, revision)
+                raise RevisionReferenceNotFound(
+                    revision.revision,
+                    downrev,
+                    (
+                        "down_revision"
+                        if downrev
+                        in revision._versioned_down_revisions
+                        else "depends_on"
+                    ),
                 )
             not_none(map_[downrev]).add_nextrev(revision)
 
@@ -814,6 +1045,243 @@ class RevisionMap:
 
         for node in self._topological_sort(revisions, heads):
             yield not_none(self.get_revision(node))
+
+    def select_revisions(
+        self,
+        targets: _RevSelectionArg,
+        exclude: _RevSelectionArg | None = None,
+    ) -> RevisionSelection:
+        """Select the target revisions together with every revision they
+        require.
+
+        This is a read-only selection operation: the revision map itself is
+        never modified.
+
+        Each target (a concrete revision id, a branch label, a ``Revision``
+        instance, or a sequence of those) is resolved using the same
+        identifier resolution as :meth:`get_revisions`, so a branch label is
+        resolved to the revision it labels rather than compared to a
+        concrete revision string.  Duplicate targets (including the same
+        revision supplied more than once, or via a label) are merged into a
+        single selection.
+
+        The resulting :class:`.RevisionSelection` contains every target and
+        all of its ancestors, following both ``down_revision`` and
+        ``depends_on`` links.  Revisions are returned in a stable
+        topological order (ancestors before descendants), and each
+        :class:`.SelectionReason` edge records *why* a revision was pulled
+        in:
+
+        * :attr:`.SelectionReason.down_revision` - the parent is named in
+          the child's ``down_revision``;
+        * :attr:`.SelectionReason.depends_on` - the parent is named in the
+          child's ``depends_on``.
+
+        :param targets: the target revision(s).
+        :param exclude: optional revisions that must not be selected.
+         If any of them is a required ancestor of a target,
+         :class:`.RequiredRevisionExcluded` is raised; Alembic does not
+         silently remove the dependency.  Excluding a revision that would
+         not have been selected anyway is allowed.
+
+        :raises: :class:`.ResolutionError` if a target or an exclusion
+         cannot be resolved to a concrete revision;
+         :class:`.RequiredRevisionExcluded` if an exclusion conflicts with
+         a target; :class:`.RevisionReferenceNotFound` if the map contains
+         references to missing revisions; :class:`.CycleDetected` if the
+         revision graph contains a cycle.
+
+        """
+        target_revs = self._resolve_selection_revisions(targets, "targets")
+        if exclude is None or (
+            not isinstance(exclude, (str, Revision)) and len(exclude) == 0
+        ):
+            exclude_revs: tuple[Revision, ...] = ()
+        else:
+            exclude_revs = self._resolve_selection_revisions(
+                exclude, "exclude"
+            )
+
+        if exclude_revs:
+            self._assert_excludes_not_required(target_revs, exclude_revs)
+
+        # note the closure is built against the full, un-normalized
+        # down_revision + depends_on links, so a reason edge is available
+        # for every requirement even when a dependency is already an
+        # ancestor through down_revision.
+        closure: dict[str, Revision] = {}
+        edges: dict[tuple[str, str], str] = {}
+        todo: Deque[Revision] = collections.deque(target_revs)
+        while todo:
+            rev = todo.popleft()
+            if rev.revision in closure:
+                continue
+            closure[rev.revision] = rev
+            for down_id in rev._versioned_down_revisions:
+                down = self._require_selection_revision(rev, down_id)
+                edges.setdefault(
+                    (down.revision, rev.revision),
+                    SelectionReason.down_revision,
+                )
+                if down.revision not in closure:
+                    todo.append(down)
+            for dep_id in rev._resolved_dependencies:
+                dep = self._require_selection_revision(rev, dep_id)
+                # if the same parent is also a down_revision parent,
+                # down_revision is the more specific reason.
+                edges.setdefault(
+                    (dep.revision, rev.revision),
+                    SelectionReason.depends_on,
+                )
+                if dep.revision not in closure:
+                    todo.append(dep)
+
+        selected = set(closure.values())
+        ordered = [
+            rev_id
+            for rev_id in reversed(
+                self._topological_sort(selected, tuple(target_revs))
+            )
+        ]
+
+        order_index = {rev_id: idx for idx, rev_id in enumerate(ordered)}
+        reason_order = {
+            SelectionReason.down_revision: 0,
+            SelectionReason.depends_on: 1,
+        }
+
+        def _edge_key(
+            edge: tuple[tuple[str, str], str],
+        ) -> tuple[int, int, int]:
+            (parent, child), reason = edge
+            return (
+                order_index[child],
+                reason_order[reason],
+                order_index[parent],
+            )
+
+        reasons = tuple(
+            SelectionReason(parent, child, reason)
+            for (parent, child), reason in sorted(edges.items(), key=_edge_key)
+        )
+
+        return RevisionSelection(
+            revisions=tuple(closure[rev_id] for rev_id in ordered),
+            targets=tuple(target_revs),
+            reasons=reasons,
+        )
+
+    def _require_selection_revision(
+        self, rev: Revision, rev_id: str
+    ) -> Revision:
+        try:
+            resolved = self._revision_map[rev_id]
+        except KeyError:
+            resolved = None
+        if resolved is None:
+            via = (
+                "down_revision"
+                if rev_id in rev._versioned_down_revisions
+                else "depends_on"
+            )
+            raise RevisionReferenceNotFound(rev.revision, rev_id, via)
+        return resolved
+
+    def _resolve_selection_revisions(
+        self,
+        values: _RevSelectionArg,
+        argument_name: str,
+    ) -> tuple[Revision, ...]:
+        if isinstance(values, (str, Revision)):
+            raw_values: Sequence[_RevisionOrStr] = (values,)
+        elif isinstance(values, (list, tuple, set, frozenset)):
+            raw_values = tuple(values)
+        else:
+            raise RevisionError(
+                "Revision selection %s=%r must be a revision identifier, "
+                "Revision object, or sequence of these"
+                % (argument_name, values)
+            )
+
+        resolved: list[Revision] = []
+        seen: set[str] = set()
+        for value in raw_values:
+            if isinstance(value, Revision):
+                rev = value
+                if rev.revision not in self._revision_map:
+                    raise ResolutionError(
+                        "No such revision or branch '%s'"
+                        % (rev.revision,),
+                        rev.revision,
+                    )
+            elif isinstance(value, str):
+                if value in ("base", "heads"):
+                    raise RevisionError(
+                        "Revision selection %s may not contain the symbolic "
+                        "identifier '%s'; specify concrete target revision(s) "
+                        "or a branch label" % (argument_name, value)
+                    )
+                rev_obj = self.get_revision(value)
+                assert rev_obj is not None
+                rev = rev_obj
+            else:
+                raise RevisionError(
+                    "Revision selection %s contains value %r, which is not "
+                    "a revision identifier string or Revision object"
+                    % (argument_name, value)
+                )
+            if rev.revision not in seen:
+                seen.add(rev.revision)
+                resolved.append(rev)
+        if not resolved:
+            raise RevisionError(
+                "Revision selection %s must contain at least one revision"
+                % argument_name
+            )
+        return tuple(resolved)
+
+    def _assert_excludes_not_required(
+        self,
+        targets: Sequence[Revision],
+        excludes: Sequence[Revision],
+    ) -> None:
+        conflicts: list[tuple[str, str, Sequence[str]]] = []
+
+        for target in targets:
+            for excluded in excludes:
+                path = self._find_requirement_path(
+                    target, excluded.revision
+                )
+                if path is not None:
+                    conflicts.append(
+                        (target.revision, excluded.revision, path)
+                    )
+
+        if conflicts:
+            conflicts.sort(key=lambda item: (item[0], item[1]))
+            raise RequiredRevisionExcluded(conflicts)
+
+    def _find_requirement_path(
+        self, target: Revision, required_id: str
+    ) -> Sequence[str] | None:
+        """Return a path target -> ... -> required_id following
+        down_revision / depends_on edges, or None if not reachable."""
+
+        queue: Deque[tuple[Revision, tuple[str, ...]]] = collections.deque()
+        queue.append((target, (target.revision,)))
+        seen = {target.revision}
+        while queue:
+            rev, path = queue.popleft()
+            if rev.revision == required_id:
+                return path
+            for down_id in rev._normalized_down_revisions:
+                down = self._require_selection_revision(rev, down_id)
+                if down.revision not in seen:
+                    seen.add(down.revision)
+                    queue.append(
+                        (down, path + (down.revision,))
+                    )
+        return None
 
     def _get_descendant_nodes(
         self,
