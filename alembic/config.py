@@ -686,6 +686,40 @@ class CommandLine:
         self._generate_args(prog)
 
     _KWARGS_OPTS = {
+        "output": (
+            "-o",
+            "--output",
+            dict(
+                type=str,
+                help="Path of the lockfile to write; defaults to "
+                "alembic.lock.json inside the script directory",
+            ),
+        ),
+        "lockfile_path": (
+            "-l",
+            "--lockfile",
+            dict(
+                dest="lockfile_path",
+                type=str,
+                help="Path of the lockfile to verify against; defaults to "
+                "alembic.lock.json inside the script directory",
+            ),
+        ),
+        "allow_new_successors": (
+            "--allow-new-successors",
+            dict(
+                action="store_true",
+                help="Tolerate new revision scripts whose dependencies "
+                "attach only to revisions already recorded in the lockfile",
+            ),
+        ),
+        "json": (
+            "--json",
+            dict(
+                action="store_true",
+                help="Emit a machine-readable JSON report on stdout",
+            ),
+        ),
         "template": (
             "-t",
             "--template",

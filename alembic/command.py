@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json as json_module
 import os
 import pathlib
+import sys
 from typing import TYPE_CHECKING
 
 from . import autogenerate as autogen
 from . import util
 from .runtime.environment import EnvironmentContext
+from .script import lockfile
 from .script import ScriptDirectory
 from .util import compat
 
@@ -850,3 +853,112 @@ def ensure_version(config: Config, sql: bool = False) -> None:
         as_sql=sql,
     ):
         script.run_env()
+
+
+def lock_generate(config: Config, output: str | None = None) -> None:
+    """Generate a migration lockfile manifest for the script directory.
+
+    The lockfile records, for every revision script, the SHA-256 of its
+    raw source bytes plus its literal ``down_revision``, ``depends_on``
+    and ``branch_labels`` metadata, sorted by revision identifier.
+    Revision modules are parsed, never imported or executed.  Generation
+    fails if any script uses dynamic metadata, or if duplicate revision
+    ids, dangling dependencies or cycles are present.
+
+    :param config: a :class:`.Config` instance.
+
+    :param output: path of the lockfile to write; defaults to
+     ``alembic.lock.json`` inside the script directory.
+
+    .. versionadded:: 1.21.0
+
+    .. seealso::
+
+        :ref:`lockfile`
+
+    """
+
+    scriptdir = ScriptDirectory.from_config(config)
+    if output is None:
+        output = lockfile.default_lockfile_path(scriptdir)
+    try:
+        manifest = lockfile.generate_manifest(scriptdir)
+    except lockfile.LockfileError as err:
+        raise util.CommandError(str(err)) from err
+    lockfile.write_manifest(manifest, output)
+    config.print_stdout(
+        "Generated lockfile %s (%d revisions)",
+        output,
+        len(manifest["revisions"]),
+    )
+
+
+def lock_check(
+    config: Config,
+    lockfile_path: str | None = None,
+    allow_new_successors: bool = False,
+    json: bool = False,
+) -> None:
+    """Verify the script directory against a migration lockfile.
+
+    Distinguishes content modifications (source bytes changed, metadata
+    unchanged), relation modifications (``down_revision``,
+    ``depends_on`` or ``branch_labels`` changed), missing scripts and
+    extra scripts.  Structural problems such as dynamic metadata,
+    duplicate revision ids, dangling dependencies and cycles are
+    reported with the offending file and reason.  Exits with a non-zero
+    status if verification fails.
+
+    :param config: a :class:`.Config` instance.
+
+    :param lockfile_path: path of the lockfile; defaults to
+     ``alembic.lock.json`` inside the script directory.
+
+    :param allow_new_successors: tolerate new revision scripts whose
+     dependencies attach only to revisions already recorded in the
+     lockfile.
+
+    :param json: emit a machine-readable JSON report on stdout.
+
+    .. versionadded:: 1.21.0
+
+    .. seealso::
+
+        :ref:`lockfile`
+
+    """
+
+    scriptdir = ScriptDirectory.from_config(config)
+    if lockfile_path is None:
+        lockfile_path = lockfile.default_lockfile_path(scriptdir)
+    try:
+        manifest = lockfile.load_manifest(lockfile_path)
+    except lockfile.LockfileError as err:
+        if json:
+            result = {
+                "status": "failed",
+                "errors": [
+                    {
+                        "file": err.filename or lockfile_path,
+                        "reason": err.reason,
+                    }
+                ],
+                "differences": [],
+                "summary": {"errors": 1},
+            }
+            config.print_stdout(json_module.dumps(result, indent=2))
+            sys.stderr.write(f"FAILED: {err}\n")
+            raise SystemExit(1) from err
+        raise util.CommandError(str(err)) from err
+    result = lockfile.check_manifest(
+        scriptdir, manifest, allow_new_successors=allow_new_successors
+    )
+    if json:
+        config.print_stdout(json_module.dumps(result, indent=2))
+        if result["status"] != "ok":
+            sys.stderr.write("FAILED: lockfile verification failed\n")
+            raise SystemExit(1)
+    else:
+        config.print_stdout(lockfile.render_text_report(result))
+        if result["status"] != "ok":
+            raise util.CommandError("lockfile verification failed")
