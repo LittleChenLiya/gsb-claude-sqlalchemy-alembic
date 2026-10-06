@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from . import checks
 from . import comments
 from . import constraints
 from . import schema
@@ -57,6 +58,7 @@ Plugin.setup_plugin_from_module(types, "alembic.autogenerate.types")
 Plugin.setup_plugin_from_module(
     constraints, "alembic.autogenerate.constraints"
 )
+Plugin.setup_plugin_from_module(checks, "alembic.autogenerate.checks")
 Plugin.setup_plugin_from_module(
     server_defaults, "alembic.autogenerate.defaults"
 )

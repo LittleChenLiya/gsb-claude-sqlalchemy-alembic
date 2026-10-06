@@ -431,6 +431,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         ) = None,
         compare_type: bool | CompareType = True,
         compare_server_default: bool | CompareServerDefault = False,
+        managed_check_constraints: Mapping[Any, Collection[str]] | None = None,
         render_item: RenderItemFn | None = None,
         literal_binds: bool = False,
         upgrade_token: str = "upgrades",
@@ -627,6 +628,46 @@ class EnvironmentContext(util.ModuleClsProxy):
          .. seealso::
 
             :paramref:`.EnvironmentContext.configure.compare_type`
+
+        :param managed_check_constraints: A mapping that explicitly names
+         CHECK constraints which autogenerate should track, given as
+         table names mapped to collections of CHECK constraint names::
+
+            context.configure(
+                # ...
+                managed_check_constraints={
+                    "orders": ["ck_orders_price", "ck_orders_qty"],
+                    "analytics.events": ["ck_events_ts"],
+                }
+            )
+
+         Only the constraints named here are compared; CHECK constraints
+         that are not listed keep their usual handling (i.e. they are
+         not compared by default).  Table keys may be plain table names,
+         ``"schema.table"`` strings, or ``(schema, table)`` tuples.
+
+         For each named constraint, autogenerate detects addition,
+         removal, and replacement of the constraint expression; an
+         expression change is rendered as an explicit
+         :meth:`.Operations.drop_constraint` /
+         :meth:`.Operations.create_check_constraint` pair.  Expression
+         comparison normalizes only insignificant whitespace and
+         redundant outer parentheses; string literals, quoted
+         identifiers, case, and token order are always compared
+         exactly, and expressions that cannot be normalized safely are
+         conservatively reported as different.
+
+         On SQLite, which cannot add or drop constraints via
+         ``ALTER TABLE``, the generated operations are rendered using
+         the :ref:`batch mode <batch_migrations>` "recreate the table"
+         strategy automatically; on other backends the standard
+         constraint DDL operations are used.
+
+         .. versionadded:: 1.21.0
+
+         .. seealso::
+
+            :ref:`autogenerate_managed_check_constraints`
 
         :param include_name: A callable function which is given
          the chance to return ``True`` or ``False`` for any database reflected
@@ -932,6 +973,8 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["compare_type"] = compare_type
         if compare_server_default is not None:
             opts["compare_server_default"] = compare_server_default
+        if managed_check_constraints is not None:
+            opts["managed_check_constraints"] = managed_check_constraints
         opts["script"] = self.script
 
         opts.update(kw)

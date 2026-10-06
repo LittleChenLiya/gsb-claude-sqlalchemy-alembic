@@ -69,12 +69,24 @@ def _compare_check_constraints(
     if conn_table is None or metadata_table is None:
         return PriorityDispatchResult.CONTINUE
 
+    # constraints named in the "managed_check_constraints" option are
+    # handled by the alembic.autogenerate.checks plugin; skip them here
+    # so that the two features don't emit duplicate operations.
+    from ..autogenerate.compare.checks import managed_check_constraint_names
+
+    managed_names = managed_check_constraint_names(
+        autogen_context, schema, tname
+    )
+
     inspector = autogen_context.inspector
     impl = autogen_context.migration_context.impl
 
-    metadata_ck_constraints = sqla_compat.all_table_check_constraints(
-        metadata_table
-    )
+    metadata_ck_constraints = {
+        ck
+        for ck in sqla_compat.all_table_check_constraints(metadata_table)
+        if sqla_compat._get_constraint_final_name(ck, autogen_context.dialect)
+        not in managed_names
+    }
 
     try:
         conn_ck_list = _InspectorConv(inspector).get_check_constraints(
@@ -87,6 +99,7 @@ def _compare_check_constraints(
         ck
         for ck in conn_ck_list
         if ck.get("name") is not None
+        and ck["name"] not in managed_names
         and autogen_context.run_name_filters(
             ck["name"],
             "check_constraint",

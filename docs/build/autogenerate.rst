@@ -131,6 +131,9 @@ Autogenerate can **optionally detect**:
 * Named CHECK constraint additions and removals.  This is **off by default**
   and must be enabled explicitly; the detection is name-based only and has
   significant limitations.  See :ref:`autogenerate_check_constraints` below.
+  Alternatively, a specific set of CHECK constraints may be tracked
+  explicitly, including expression changes, using
+  :ref:`autogenerate_managed_check_constraints`.
 
 * Change of column type.  This will occur by default unless the parameter
   :paramref:`.EnvironmentContext.configure.compare_type` is set to ``False``.
@@ -276,6 +279,86 @@ Given the above, the feature is most appropriate for a schema in which all
 CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
+
+.. _autogenerate_managed_check_constraints:
+
+Explicitly Managed CHECK Constraints
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.21.0
+
+For applications that want expression-level change detection for a known,
+limited set of CHECK constraints, autogenerate supports an **explicitly
+managed** list of constraints, named per table, via the
+:paramref:`.EnvironmentContext.configure.managed_check_constraints`
+parameter::
+
+    context.configure(
+        # ...
+        managed_check_constraints={
+            "orders": ["ck_orders_price", "ck_orders_qty"],
+            "analytics.events": ["ck_events_ts"],  # schema-qualified
+        }
+    )
+
+Only the constraints named here are compared;  CHECK constraints that are
+not listed keep their usual handling, i.e. they are not compared at all
+unless the opt-in plugin described in :ref:`autogenerate_check_constraints`
+is also enabled.  Table keys may be plain table names, ``"schema.table"``
+strings, or ``(schema, table)`` tuples.  On the metadata side, constraint
+names are resolved through any naming convention in effect, so the names
+listed here are the final database-level names.
+
+For each managed constraint, autogenerate detects:
+
+* **addition** - the constraint is in the metadata but not the database;
+  rendered as :meth:`.Operations.create_check_constraint`
+* **removal** - the constraint is in the database but not the metadata;
+  rendered as :meth:`.Operations.drop_constraint`
+* **expression replacement** - the constraint exists on both sides but the
+  expression differs; rendered as an explicit
+  :meth:`.Operations.drop_constraint` **plus**
+  :meth:`.Operations.create_check_constraint` pair.  The two operations are
+  always generated together, so a comparison that cannot be performed
+  safely never produces a half-complete change.  Downgrades re-create the
+  constraint using the original expression as reflected from the database,
+  not a normalized approximation of it.
+
+Expression comparison is deliberately conservative.  Only insignificant
+whitespace and redundant outer parentheses are normalized away (including
+the unmatched trailing parenthesis that some reflection backends include
+in reflected CHECK text).  String literals, quoted identifiers, letter
+case, and the order of tokens are always compared exactly, and any
+expression that cannot be tokenized or balanced safely is conservatively
+reported as **different**, producing a drop/create pair rather than
+silently assuming equality.  Even so, backends that rewrite expressions
+on reflection (PostgreSQL rewrites ``x != y`` as ``x <> y``, expands
+``BETWEEN``, casts ``IN`` lists, etc.) will produce spurious drop/create
+pairs; review candidate migrations by hand, as always.
+
+**Dialect scope**:
+
+* **SQLite** cannot add or drop constraints with ``ALTER TABLE``, so
+  operations produced for managed CHECK constraints are automatically
+  rendered using the :ref:`batch mode <batch_migrations>`
+  "recreate the table" strategy (``op.batch_alter_table()``), whether or
+  not ``render_as_batch`` is set.  Note that reflection of CHECK
+  constraints on SQLite relies on parsing the ``CREATE TABLE`` statement
+  and may not distinguish multiple CHECK constraints on a single table
+  correctly on all SQLAlchemy versions; one managed CHECK constraint per
+  table is the best-supported form on this backend.
+* **All other backends** that reflect CHECK constraints (PostgreSQL,
+  Oracle, MySQL/MariaDB recent enough to enforce them, and others) use
+  the standard constraint DDL operations directly.
+* Backends whose dialect does not implement CHECK constraint reflection
+  skip the comparison with a warning.
+
+A complete, self-contained demonstration that generates a migration,
+upgrades, and downgrades against a SQLite database - verifying the
+constraint behavior at each step - can be run from the repository root
+in a few seconds::
+
+    python tools/demo_managed_check_constraints.py
 
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

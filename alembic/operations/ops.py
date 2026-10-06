@@ -2699,16 +2699,19 @@ class ModifyTableOps(OpContainer):
         ops: Sequence[MigrateOperation],
         *,
         schema: str | None = None,
+        render_as_batch: bool = False,
     ) -> None:
         super().__init__(ops)
         self.table_name = table_name
         self.schema = schema
+        self.render_as_batch = render_as_batch
 
     def reverse(self) -> ModifyTableOps:
         return ModifyTableOps(
             self.table_name,
             ops=list(reversed([op.reverse() for op in self.ops])),
             schema=self.schema,
+            render_as_batch=self.render_as_batch,
         )
 
 
