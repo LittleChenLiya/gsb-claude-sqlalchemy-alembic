@@ -15,6 +15,7 @@ with the `SQLAlchemy <https://www.sqlalchemy.org>`_ Database Toolkit for Python.
    naming
    batch
    branches
+   manifest
    ops
    cookbook
    api/index

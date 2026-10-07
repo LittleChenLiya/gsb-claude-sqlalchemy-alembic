@@ -825,6 +825,39 @@ class CommandLine:
                 ),
             ),
         ),
+        "output": (
+            "-o",
+            "--output",
+            dict(
+                default="alembic-manifest.json",
+                type=str,
+                help="Path of the manifest file to write",
+            ),
+        ),
+        "manifest": (
+            "--manifest",
+            dict(
+                default="alembic-manifest.json",
+                type=str,
+                help="Path of the manifest file to verify against",
+            ),
+        ),
+        "allow_new_successors": (
+            "--allow-new-successors",
+            dict(
+                action="store_true",
+                help="Allow new revision scripts that extend existing "
+                "manifest revisions with consistent relationships",
+            ),
+        ),
+        "json_output": (
+            "--json",
+            dict(
+                action="store_true",
+                dest="json_output",
+                help="Emit a machine-readable JSON report",
+            ),
+        ),
     }
     _POSITIONAL_OPTS = {
         "directory": dict(help="location of scripts directory"),

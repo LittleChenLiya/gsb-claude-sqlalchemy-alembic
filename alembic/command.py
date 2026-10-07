@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 from typing import TYPE_CHECKING
@@ -850,3 +851,96 @@ def ensure_version(config: Config, sql: bool = False) -> None:
         as_sql=sql,
     ):
         script.run_env()
+
+
+def manifest_generate(
+    config: Config, output: str = "alembic-manifest.json"
+) -> None:
+    """Generate a migration lock manifest for the scripts directory.
+
+    Records, for every revision script, the SHA-256 hash of its raw
+    source bytes plus its literal ``down_revision``, ``depends_on`` and
+    ``branch_labels`` metadata, sorted by revision identifier.  The
+    scripts are parsed, never imported or executed, and no database
+    connection is required.
+
+    Generation fails if any script uses dynamic (non-literal) metadata,
+    or if duplicate revision ids, dangling dependencies or dependency
+    cycles are detected; the offending file and reason are reported.
+
+    :param config: a :class:`.Config` instance.
+
+    :param output: path of the manifest file to write.
+
+     .. versionadded:: 1.17
+
+    """
+
+    from .script import manifest as _manifest
+
+    script = ScriptDirectory.from_config(config)
+    try:
+        manifest = _manifest.generate_manifest(script)
+    except _manifest.ManifestError as err:
+        raise util.CommandError(str(err))
+    _manifest.write_manifest(manifest, output)
+    config.print_stdout(
+        "Manifest written to %s (%d revision(s))",
+        output,
+        len(manifest["revisions"]),
+    )
+
+
+def manifest_check(
+    config: Config,
+    manifest: str = "alembic-manifest.json",
+    allow_new_successors: bool = False,
+    json_output: bool = False,
+) -> None:
+    """Verify migration scripts against a lock manifest.
+
+    Re-scans the scripts directory (parsing only, never importing) and
+    reports content modifications, relationship modifications, missing
+    scripts and extra scripts relative to the given manifest.  Exits
+    with an error if any difference or structural problem is found.
+
+    :param config: a :class:`.Config` instance.
+
+    :param manifest: path of the manifest file to verify against.
+
+    :param allow_new_successors: allow new revision scripts that extend
+     existing manifest revisions with consistent relationships.
+
+    :param json_output: emit a machine-readable JSON report.
+
+     .. versionadded:: 1.17
+
+    """
+
+    from .script import manifest as _manifest
+
+    script = ScriptDirectory.from_config(config)
+    try:
+        manifest_doc = _manifest.read_manifest(manifest)
+    except _manifest.ManifestError as err:
+        raise util.CommandError(str(err))
+    entries, errors = _manifest.scan_revisions(script)
+    report = _manifest.check_manifest(
+        manifest_doc,
+        entries,
+        errors,
+        allow_new_successors=allow_new_successors,
+    )
+    if json_output:
+        config.print_stdout(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        for line in _manifest.format_report(report):
+            config.print_stdout(line)
+    if not report["ok"]:
+        raise util.CommandError(
+            "manifest check failed: scripts directory differs from "
+            f"manifest {manifest!r}"
+        )
+    config.print_stdout(
+        "Manifest check passed: %d revision(s) verified", len(entries)
+    )
