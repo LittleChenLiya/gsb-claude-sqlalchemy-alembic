@@ -7,40 +7,23 @@ from typing import Optional
 from typing import TYPE_CHECKING
 from typing import Union
 
-from sqlalchemy import schema as sa_schema
-
 from ..autogenerate.compare.util import _InspectorConv
+from ..autogenerate.compare.util import _make_check_constraint
+from ..autogenerate.compare.util import _managed_ck_names_for_table
 from ..operations import ops
 from ..util import PriorityDispatchResult
 from ..util import sqla_compat
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine.interfaces import ReflectedCheckConstraint
     from sqlalchemy.sql.elements import quoted_name
-    from sqlalchemy.sql.schema import CheckConstraint
     from sqlalchemy.sql.schema import Table
 
     from ..autogenerate.api import AutogenContext
-    from ..ddl.impl import DefaultImpl
     from ..operations.ops import ModifyTableOps
     from ..runtime.plugins import Plugin
 
 
 log = logging.getLogger(__name__)
-
-
-def _make_check_constraint(
-    impl: DefaultImpl,
-    params: ReflectedCheckConstraint,
-    conn_table: Table,
-) -> CheckConstraint:
-    const = sa_schema.CheckConstraint(
-        params["sqltext"],
-        name=params["name"],
-        table=conn_table,
-        **impl.adjust_reflected_dialect_options(params, "check_constraint"),
-    )
-    return const
 
 
 # Current behaviour is kinda unfortunate
@@ -72,9 +55,23 @@ def _compare_check_constraints(
     inspector = autogen_context.inspector
     impl = autogen_context.migration_context.impl
 
-    metadata_ck_constraints = sqla_compat.all_table_check_constraints(
-        metadata_table
+    # constraint names that are explicitly managed via the
+    # "managed_check_constraints" option are handled by the
+    # managed-check-constraint comparator instead
+    managed_names = _managed_ck_names_for_table(
+        autogen_context.opts.get("managed_check_constraints"),
+        schema,
+        str(tname),
     )
+
+    metadata_ck_constraints = {
+        ck
+        for ck in sqla_compat.all_table_check_constraints(metadata_table)
+        if str(
+            sqla_compat._get_constraint_final_name(ck, autogen_context.dialect)
+        )
+        not in managed_names
+    }
 
     try:
         conn_ck_list = _InspectorConv(inspector).get_check_constraints(
@@ -87,6 +84,7 @@ def _compare_check_constraints(
         ck
         for ck in conn_ck_list
         if ck.get("name") is not None
+        and str(ck["name"]) not in managed_names
         and autogen_context.run_name_filters(
             ck["name"],
             "check_constraint",

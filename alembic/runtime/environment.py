@@ -431,6 +431,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         ) = None,
         compare_type: bool | CompareType = True,
         compare_server_default: bool | CompareServerDefault = False,
+        managed_check_constraints: dict[str, Collection[str]] | None = None,
         render_item: RenderItemFn | None = None,
         literal_binds: bool = False,
         upgrade_token: str = "upgrades",
@@ -627,6 +628,31 @@ class EnvironmentContext(util.ModuleClsProxy):
          .. seealso::
 
             :paramref:`.EnvironmentContext.configure.compare_type`
+
+        :param managed_check_constraints: A dictionary mapping table names
+         to collections of CHECK constraint names that autogenerate should
+         explicitly track.  Table names may be schema-qualified using the
+         ``"schemaname.tablename"`` form.  For each listed constraint,
+         autogenerate compares the constraint reflected from the database
+         against the one present in the target metadata and generates
+         operations to add, drop, or replace (drop + create, when the
+         expression changed) the constraint.  CHECK constraints that are
+         not listed keep their default handling, i.e. they are not
+         compared.  Defaults to ``None``, meaning no CHECK constraints
+         are managed.
+
+         On SQLite, operations for managed CHECK constraints are
+         automatically rendered using the :ref:`batch mode
+         <batch_migrations>` table-recreate strategy, since SQLite does
+         not support ALTER of constraints; other backends use the
+         standard ``op.create_check_constraint()`` /
+         ``op.drop_constraint()`` directives.
+
+         .. versionadded:: 1.20.1
+
+         .. seealso::
+
+            :ref:`autogenerate_managed_check_constraints`
 
         :param include_name: A callable function which is given
          the chance to return ``True`` or ``False`` for any database reflected
@@ -932,6 +958,8 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["compare_type"] = compare_type
         if compare_server_default is not None:
             opts["compare_server_default"] = compare_server_default
+        if managed_check_constraints is not None:
+            opts["managed_check_constraints"] = managed_check_constraints
         opts["script"] = self.script
 
         opts.update(kw)

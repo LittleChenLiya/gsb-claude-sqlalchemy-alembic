@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from collections.abc import Mapping
 from typing import Any
 from typing import TYPE_CHECKING
 
+from sqlalchemy import schema as sa_schema
 from sqlalchemy.sql.elements import conv
 
 if TYPE_CHECKING:
@@ -16,6 +18,9 @@ if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import ReflectedIndex
     from sqlalchemy.engine.interfaces import ReflectedUniqueConstraint
     from sqlalchemy.engine.reflection import _ReflectionInfo
+    from sqlalchemy.sql.schema import CheckConstraint
+
+    from ...ddl.impl import DefaultImpl
 
 _INSP_KEYS = (
     "columns",
@@ -34,6 +39,219 @@ _CONSTRAINT_INSP_KEYS = (
     "unique_constraints",
     "check_constraints",
 )
+
+
+def _tokenize_ck_expression(text: str) -> list[tuple[str, str]] | None:
+    """Tokenize a CHECK constraint expression for normalization.
+
+    Returns a list of ``(kind, text)`` tokens where ``kind`` is one of
+    ``"literal"`` (string literals and quoted identifiers, kept verbatim),
+    ``"word"`` (keywords, identifiers, numbers) or ``"punct"`` (individual
+    punctuation / operator characters).  Whitespace is discarded.
+
+    Returns ``None`` if the text cannot be tokenized, e.g. it contains an
+    unterminated string literal or quoted identifier.  In that case the
+    caller should assume the expression cannot be normalized.
+    """
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"', "`"):
+            # string literal or quoted identifier; the quote char may be
+            # escaped by doubling it
+            j = i + 1
+            while True:
+                j = text.find(ch, j)
+                if j == -1:
+                    return None
+                if j + 1 < n and text[j + 1] == ch:
+                    j += 2
+                    continue
+                break
+            tokens.append(("literal", text[i : j + 1]))
+            i = j + 1
+        elif ch == "[":
+            # bracket-quoted identifier (SQL Server style)
+            j = text.find("]", i + 1)
+            if j == -1:
+                return None
+            tokens.append(("literal", text[i : j + 1]))
+            i = j + 1
+        elif ch.isspace():
+            i += 1
+        elif ch.isalnum() or ch in ("_", "$"):
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] in ("_", "$")):
+                j += 1
+            tokens.append(("word", text[i:j]))
+            i = j
+        else:
+            tokens.append(("punct", ch))
+            i += 1
+    return tokens
+
+
+def _ck_tokens_paren_balance(tokens: list[tuple[str, str]]) -> int:
+    depth = 0
+    for kind, value in tokens:
+        if kind == "punct":
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+    return depth
+
+
+def _strip_unbalanced_trailing_parens(text: str) -> str:
+    """Remove trailing ``)`` characters that unbalance the expression.
+
+    Some reflection paths (e.g. older SQLite dialect parsing) include the
+    closing parenthesis of the surrounding ``CHECK (...)`` clause - and
+    even that of the CREATE TABLE statement itself - in the reflected
+    expression text.  A trailing ``)`` that makes the parenthesis balance
+    negative cannot be part of a valid standalone expression, so it is
+    safe to drop.  All other characters, including whitespace, string
+    literals and quoted identifiers, are kept exactly as written; if the
+    text cannot be tokenized it is returned unchanged.
+    """
+    tokens = _tokenize_ck_expression(text)
+    if tokens is None:
+        return text
+    pop = 0
+    balance = _ck_tokens_paren_balance(tokens)
+    while (
+        pop < len(tokens)
+        and tokens[-1 - pop] == ("punct", ")")
+        and balance < 0
+    ):
+        pop += 1
+        balance += 1
+    if not pop:
+        return text
+    # drop the last ``pop`` ")" characters from the original text; only
+    # whitespace may follow them, so the remaining text is the original
+    # expression verbatim
+    out = []
+    remaining = pop
+    for ch in reversed(text):
+        if remaining and ch == ")":
+            remaining -= 1
+            continue
+        out.append(ch)
+    return "".join(reversed(out)).rstrip()
+
+
+def _normalize_check_expression(text: str) -> str | None:
+    """Normalize a CHECK constraint expression for comparison.
+
+    The normalization is deliberately conservative: it removes
+    insignificant whitespace and redundant outer parentheses only.
+    String literals, quoted (case-sensitive) identifiers and the order of
+    tokens - and therefore of operators and operands - are preserved
+    exactly as written.
+
+    Returns ``None`` if the expression cannot be tokenized or has
+    unbalanced parentheses; callers should treat this as "cannot be
+    compared" and conservatively report a difference.
+    """
+    tokens = _tokenize_ck_expression(text)
+    if tokens is None:
+        return None
+
+    # strip pairs of parentheses that enclose the whole expression
+    while (
+        len(tokens) >= 2
+        and tokens[0] == ("punct", "(")
+        and tokens[-1] == ("punct", ")")
+    ):
+        depth = 0
+        encloses_all = True
+        for idx, (kind, value) in enumerate(tokens):
+            if kind == "punct":
+                if value == "(":
+                    depth += 1
+                elif value == ")":
+                    depth -= 1
+                    if depth < 0:
+                        return None
+                    if depth == 0 and idx != len(tokens) - 1:
+                        encloses_all = False
+                        break
+        if depth != 0:
+            return None
+        if not encloses_all:
+            break
+        tokens = tokens[1:-1]
+
+    # remaining parentheses must be balanced
+    depth = 0
+    for kind, value in tokens:
+        if kind == "punct":
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+                if depth < 0:
+                    return None
+    if depth != 0:
+        return None
+
+    # join tokens; a single space is kept only between two adjacent
+    # word-like tokens so that e.g. "a b" cannot become "ab"
+    out: list[str] = []
+    prev_kind: str | None = None
+    for kind, value in tokens:
+        if (
+            out
+            and prev_kind in ("word", "literal")
+            and kind in ("word", "literal")
+        ):
+            out.append(" ")
+        out.append(value)
+        prev_kind = kind
+    return "".join(out)
+
+
+def _make_check_constraint(
+    impl: DefaultImpl,
+    params: ReflectedCheckConstraint,
+    conn_table: Table,
+) -> CheckConstraint:
+    sqltext = params["sqltext"]
+    if isinstance(sqltext, str):
+        sqltext = _strip_unbalanced_trailing_parens(sqltext)
+    const = sa_schema.CheckConstraint(
+        sqltext,
+        name=params["name"],
+        table=conn_table,
+        **impl.adjust_reflected_dialect_options(params, "check_constraint"),
+    )
+    return const
+
+
+def _managed_ck_names_for_table(
+    managed: Mapping[str, Collection[str]] | None,
+    schema: str | None,
+    tname: str,
+) -> frozenset[str]:
+    """Return the set of managed CHECK constraint names for a table.
+
+    The ``managed`` mapping is keyed by table name, optionally
+    schema-qualified as ``"schemaname.tablename"``.  A schema-qualified
+    entry takes precedence over an unqualified one for the same table.
+    """
+    if not managed:
+        return frozenset()
+    names: Collection[str] | None = None
+    if schema:
+        names = managed.get("%s.%s" % (schema, tname))
+    if names is None:
+        names = managed.get(tname)
+    if not names:
+        return frozenset()
+    return frozenset(str(name) for name in names)
 
 
 class _InspectorConv:

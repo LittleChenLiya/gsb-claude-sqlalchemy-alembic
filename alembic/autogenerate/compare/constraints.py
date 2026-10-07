@@ -19,6 +19,9 @@ from sqlalchemy.sql.schema import Index
 from sqlalchemy.sql.schema import UniqueConstraint
 
 from .util import _InspectorConv
+from .util import _make_check_constraint
+from .util import _managed_ck_names_for_table
+from .util import _normalize_check_expression
 from ... import util
 from ...ddl._autogen import is_index_sig
 from ...ddl._autogen import is_uq_sig
@@ -27,11 +30,13 @@ from ...util import PriorityDispatchResult
 from ...util import sqla_compat
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine.interfaces import Dialect
     from sqlalchemy.engine.interfaces import ReflectedForeignKeyConstraint
     from sqlalchemy.engine.interfaces import ReflectedIndex
     from sqlalchemy.engine.interfaces import ReflectedUniqueConstraint
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.elements import TextClause
+    from sqlalchemy.sql.schema import CheckConstraint
     from sqlalchemy.sql.schema import Column
     from sqlalchemy.sql.schema import Table
 
@@ -795,6 +800,228 @@ def _compare_nullable(
     return PriorityDispatchResult.CONTINUE
 
 
+def _render_ck_expression(
+    const: CheckConstraint, dialect: Dialect
+) -> str | None:
+    """Render the SQL text of a CheckConstraint for comparison.
+
+    Returns ``None`` if the expression cannot be rendered to text.
+    """
+    sqltext = const.sqltext
+    if isinstance(sqltext, str):
+        return sqltext
+    try:
+        if isinstance(sqltext, expression.TextClause):
+            return str(sqltext)
+        return str(
+            sqltext.compile(
+                dialect=dialect, compile_kwargs={"literal_binds": True}
+            )
+        )
+    except Exception:
+        return None
+
+
+def _ck_expressions_differ(
+    metadata_const: CheckConstraint,
+    conn_const: CheckConstraint,
+    dialect: Dialect,
+) -> bool:
+    """Compare the expressions of two CHECK constraints.
+
+    Returns True if the expressions differ, or if they cannot be
+    normalized for comparison (in which case a difference is
+    conservatively assumed).
+    """
+    metadata_text = _render_ck_expression(metadata_const, dialect)
+    conn_text = _render_ck_expression(conn_const, dialect)
+
+    metadata_norm = (
+        _normalize_check_expression(metadata_text)
+        if metadata_text is not None
+        else None
+    )
+    conn_norm = (
+        _normalize_check_expression(conn_text)
+        if conn_text is not None
+        else None
+    )
+
+    if metadata_norm is None or conn_norm is None:
+        log.info(
+            "Cannot normalize CHECK constraint expression %r vs. %r; "
+            "conservatively assuming the expressions differ",
+            metadata_text,
+            conn_text,
+        )
+        return True
+    return metadata_norm != conn_norm
+
+
+def _compare_managed_check_constraints(
+    autogen_context: AutogenContext,
+    modify_table_ops: ModifyTableOps,
+    schema: str | None,
+    tname: quoted_name | str,
+    conn_table: Table | None,
+    metadata_table: Table | None,
+) -> PriorityDispatchResult:
+    """Compare explicitly managed CHECK constraints for a table.
+
+    Only the constraint names listed for this table in the
+    ``managed_check_constraints`` option are considered; all other CHECK
+    constraints keep their default (non-)handling.
+    """
+    managed_names = _managed_ck_names_for_table(
+        autogen_context.opts.get("managed_check_constraints"),
+        schema,
+        str(tname),
+    )
+    if not managed_names:
+        return PriorityDispatchResult.CONTINUE
+
+    if conn_table is None or metadata_table is None:
+        # table is being created or dropped as a whole; constraints
+        # are handled inline with the table definition
+        return PriorityDispatchResult.CONTINUE
+
+    try:
+        new_ops = _managed_check_constraint_ops(
+            autogen_context,
+            schema,
+            tname,
+            conn_table,
+            metadata_table,
+            managed_names,
+        )
+    except Exception:
+        # comparison failed; do not emit a partial set of operations
+        log.warning(
+            "Could not compare managed CHECK constraints on table %r; "
+            "no operations will be generated for them",
+            tname,
+            exc_info=True,
+        )
+        return PriorityDispatchResult.CONTINUE
+
+    if new_ops:
+        if autogen_context.dialect.name == "sqlite":
+            # SQLite cannot ALTER constraints; the operations must run
+            # under batch mode, which recreates the table
+            modify_table_ops.force_batch = True
+        modify_table_ops.ops.extend(new_ops)
+
+    return PriorityDispatchResult.CONTINUE
+
+
+def _managed_check_constraint_ops(
+    autogen_context: AutogenContext,
+    schema: str | None,
+    tname: quoted_name | str,
+    conn_table: Table,
+    metadata_table: Table,
+    managed_names: frozenset[str],
+) -> list[ops.MigrateOperation]:
+    inspector = autogen_context.inspector
+    impl = autogen_context.migration_context.impl
+    dialect = autogen_context.dialect
+
+    metadata_ck_by_name: dict[str, CheckConstraint] = {}
+    for ck in sqla_compat.all_table_check_constraints(metadata_table):
+        final_name = sqla_compat._get_constraint_final_name(ck, dialect)
+        if final_name is not None and str(final_name) in managed_names:
+            metadata_ck_by_name[str(final_name)] = ck
+
+    try:
+        conn_ck_list = _InspectorConv(inspector).get_check_constraints(
+            tname, schema=schema
+        )
+    except NotImplementedError:
+        log.warning(
+            "Dialect %r does not support reflection of CHECK constraints; "
+            "managed CHECK constraints on table %r cannot be compared",
+            dialect.name,
+            tname,
+        )
+        return []
+
+    conn_ck_by_name: dict[str, CheckConstraint] = {}
+    for params in conn_ck_list:
+        name = params.get("name")
+        if name is None or str(name) not in managed_names:
+            continue
+        if not autogen_context.run_name_filters(
+            str(name),
+            "check_constraint",
+            {"table_name": tname, "schema_name": schema},
+        ):
+            continue
+        conn_ck_by_name[str(name)] = _make_check_constraint(
+            impl, params, conn_table
+        )
+
+    new_ops: list[ops.MigrateOperation] = []
+
+    for removed_name in sorted(
+        set(conn_ck_by_name).difference(metadata_ck_by_name)
+    ):
+        conn_obj = conn_ck_by_name[removed_name]
+        if autogen_context.run_object_filters(
+            conn_obj, removed_name, "check_constraint", True, None
+        ):
+            new_ops.append(ops.DropConstraintOp.from_constraint(conn_obj))
+            log.info(
+                "Detected removed managed check constraint %r on table %r",
+                removed_name,
+                tname,
+            )
+
+    for existing_name in sorted(
+        set(metadata_ck_by_name).intersection(conn_ck_by_name)
+    ):
+        metadata_obj = metadata_ck_by_name[existing_name]
+        conn_obj = conn_ck_by_name[existing_name]
+
+        if _ck_expressions_differ(metadata_obj, conn_obj, dialect):
+            if autogen_context.run_object_filters(
+                metadata_obj,
+                existing_name,
+                "check_constraint",
+                False,
+                conn_obj,
+            ):
+                log.info(
+                    "Detected changed managed check constraint %r "
+                    "on table %r",
+                    existing_name,
+                    tname,
+                )
+                # an expression change is always an explicit
+                # drop + create pair; the drop carries the reflected
+                # constraint so that a downgrade restores the original
+                # expression text
+                new_ops.append(ops.DropConstraintOp.from_constraint(conn_obj))
+                new_ops.append(
+                    ops.AddConstraintOp.from_constraint(metadata_obj)
+                )
+
+    for added_name in sorted(
+        set(metadata_ck_by_name).difference(conn_ck_by_name)
+    ):
+        metadata_obj = metadata_ck_by_name[added_name]
+        if autogen_context.run_object_filters(
+            metadata_obj, added_name, "check_constraint", False, None
+        ):
+            new_ops.append(ops.AddConstraintOp.from_constraint(metadata_obj))
+            log.info(
+                "Detected added managed check constraint %r on table %r",
+                added_name,
+                tname,
+            )
+
+    return new_ops
+
+
 def setup(plugin: Plugin) -> None:
     plugin.add_autogenerate_comparator(
         _compare_indexes_and_uniques,
@@ -805,6 +1032,11 @@ def setup(plugin: Plugin) -> None:
         _compare_foreign_keys,
         "table",
         "foreignkeys",
+    )
+    plugin.add_autogenerate_comparator(
+        _compare_managed_check_constraints,
+        "table",
+        "managed_check_constraints",
     )
     plugin.add_autogenerate_comparator(
         _compare_nullable,

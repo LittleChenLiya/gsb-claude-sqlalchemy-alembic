@@ -277,6 +277,84 @@ CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
 
+.. _autogenerate_managed_check_constraints:
+
+Detecting Managed CHECK Constraints
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.20.1
+
+For applications that want expression-level detection of CHECK constraint
+changes without opting every constraint in the schema into comparison,
+autogenerate supports an explicitly **managed** set of CHECK constraints via
+the :paramref:`.EnvironmentContext.configure.managed_check_constraints`
+parameter.  The parameter is a dictionary that maps a table name to the
+collection of CHECK constraint names that should be tracked for that table::
+
+    context.configure(
+        # ...
+        managed_check_constraints={
+            "items": ["ck_price"],
+            "account": ["ck_account_balance", "ck_account_opened"],
+        }
+    )
+
+Table names may be schema-qualified using the ``"schemaname.tablename"``
+form; a schema-qualified entry takes precedence over an unqualified entry
+for the same table.
+
+For each listed constraint, autogenerate compares the constraint reflected
+from the database against the constraint of the same name in the target
+metadata, and generates the appropriate operations:
+
+* a constraint present only in the metadata is **added**
+  (``op.create_check_constraint()``);
+* a managed constraint present only in the database is **dropped**
+  (``op.drop_constraint()``);
+* a constraint whose **expression changed** is replaced with an explicit
+  **drop + create** pair.  The drop operation carries the reflected
+  constraint, so the generated **downgrade recreates the constraint using
+  the original expression text** exactly as it exists in the database,
+  not a normalized approximation of it.
+
+CHECK constraints that are not listed for a table keep their default
+handling, i.e. they are not compared.  In particular, anonymous (unnamed)
+constraints can never be managed, since management is by name.  If the
+:ref:`checkconstraint_byname <autogenerate_check_constraints>` plugin is
+also enabled, it skips any constraint that is listed as managed.
+
+Expression comparison
+"""""""""""""""""""""
+
+Expressions are compared after a deliberately conservative normalization
+that removes only **insignificant whitespace** and **redundant outer
+parentheses**.  String literals, quoted (case-sensitive) identifiers, and
+the order of tokens - and therefore of operators and operands - are always
+preserved exactly; ``0 <= price`` is *not* considered equal to
+``price >= 0``.  If an expression cannot be tokenized or normalized (for
+example it contains an unterminated string literal), the constraint is
+conservatively reported as **different**, producing a complete drop+create
+pair; a failed comparison never generates a partial set of operations.
+
+Dialect scope
+"""""""""""""
+
+The feature relies on the dialect's ability to reflect CHECK constraints
+(:meth:`sqlalchemy.engine.reflection.Inspector.get_check_constraints`),
+which is supported by SQLite, PostgreSQL, MySQL / MariaDB, Oracle, and
+Microsoft SQL Server.  On dialects that cannot reflect CHECK constraints,
+no operations are generated and a warning is logged.
+
+* On **SQLite**, which cannot ALTER constraints, the generated operations
+  are automatically rendered using :ref:`batch mode <batch_migrations>`
+  (``op.batch_alter_table()``), which recreates the table; this applies to
+  both the upgrade and the downgrade.
+* On **all other backends**, the standard ``op.create_check_constraint()``
+  and ``op.drop_constraint()`` directives are used.
+
+As always, the candidate migrations that autogenerate produces must be
+reviewed by hand.
+
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

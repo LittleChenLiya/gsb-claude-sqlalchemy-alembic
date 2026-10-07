@@ -141,7 +141,7 @@ def _render_modify_table(
     autogen_context: AutogenContext, op: ModifyTableOps
 ) -> list[str]:
     opts = autogen_context.opts
-    render_as_batch = opts.get("render_as_batch", False)
+    render_as_batch = opts.get("render_as_batch", False) or op.force_batch
 
     if op.ops:
         lines = []

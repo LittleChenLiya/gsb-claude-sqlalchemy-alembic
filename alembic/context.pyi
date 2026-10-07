@@ -183,6 +183,7 @@ def configure(
             bool | None,
         ]
     ) = False,
+    managed_check_constraints: dict[str, Collection[str]] | None = None,
     render_item: (
         Callable[[str, Any, AutogenContext], str | Literal[False]] | None
     ) = None,
